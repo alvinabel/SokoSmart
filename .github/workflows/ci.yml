@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (shared + backend + api)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: |
+          pip install -r backend/requirements-dev.txt -r api/requirements-dev.txt
+      - name: Compile (syntax) check
+        run: python -m compileall -q shared backend api infra
+      - name: Backend tests
+        run: cd backend && python -m pytest -q
+      - name: API tests
+        run: cd api && python -m pytest -q
+
+  frontend:
+    name: Frontend PWA build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: frontend
+      - name: Generate PWA icons
+        run: npm run generate:icons
+        working-directory: frontend
+      - name: Build (incl. service worker + manifest)
+        run: npm run build
+        working-directory: frontend
+      - name: Upload PWA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist

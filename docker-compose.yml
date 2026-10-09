@@ -1,0 +1,98 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: agro_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-agrobasket}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-mongoroot}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-mongorootpass}
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh mongodb://localhost:27017/agrobasket --quiet
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Flask — identity provider + admin dashboard/moderation API
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: agro_backend
+    restart: unless-stopped
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-7}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@agrobasket.test}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
+    ports:
+      - "${BACKEND_PORT:-5001}:5001"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  # FastAPI — marketplace REST API
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: agro_api
+    restart: unless-stopped
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-7}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  # Frontend — Vite dev server (PWA). For production, build and deploy to Vercel.
+  frontend:
+    build: ./frontend
+    container_name: agro_frontend
+    restart: unless-stopped
+    environment:
+      VITE_AUTH_API_URL: http://localhost:${BACKEND_PORT:-5001}
+      VITE_MARKET_API_URL: http://localhost:${API_PORT:-8000}
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    depends_on:
+      - backend
+      - api
+
+  # Idempotent seeders: roles, admin/demo users, categories, demo listings
+  seed:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.seed
+    container_name: agro_seed
+    entrypoint: ["python", "infra/seed_all.py"]
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
+      JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@agrobasket.test}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
+      SEED_DEMO_ITEMS: ${SEED_DEMO_ITEMS:-true}
+    profiles: ["tools"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
