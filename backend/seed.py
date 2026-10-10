@@ -3,7 +3,7 @@
 Run standalone (from repo root):  ``python backend/seed.py``
 Run via seed service:             ``docker compose --profile tools run --rm seed``
 
-Safe to re-run any number of times — existing documents are kept.
+Safe to re-run any number of times — existing rows are kept.
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from shared.categories import CATEGORIES  # noqa: E402
-from shared.mongo import COLLECTIONS, ensure_indexes, get_db  # noqa: E402
+from shared.db import fetch_one, get_conn, insert_returning  # noqa: E402
 from shared.passwords import hash_password  # noqa: E402
 from shared.roles import Role  # noqa: E402
+from shared.schema import ensure_schema  # noqa: E402
 
 DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "Demo@12345")
 
@@ -30,22 +31,16 @@ def now() -> datetime:
 
 
 def _ensure_user(db, name: str, email: str, plain_password: str, role: str) -> str:
-    existing = db[COLLECTIONS["users"]].find_one({"email": email})
-    if existing:
+    if fetch_one(db, "SELECT 1 AS ok FROM users WHERE email = %s", (email,)):
         return "kept"
-    db[COLLECTIONS["users"]].insert_one(
-        {
-            "name": name,
-            "email": email,
-            "password_hash": hash_password(plain_password),
-            "role": role,
-            "phone": "",
-            "location": {},
-            "status": "active",
-            "verified": False,
-            "created_at": now(),
-            "updated_at": now(),
-        }
+    insert_returning(
+        db,
+        """
+        INSERT INTO users (name, email, password_hash, role, phone, location, status, verified, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, '', '{}'::jsonb, 'active', false, %s, %s)
+        RETURNING id
+        """,
+        (name, email, hash_password(plain_password), role, now(), now()),
     )
     return "created"
 
@@ -53,15 +48,19 @@ def _ensure_user(db, name: str, email: str, plain_password: str, role: str) -> s
 def _ensure_categories(db) -> int:
     inserted = 0
     for cat in CATEGORIES:
-        if db[COLLECTIONS["categories"]].find_one({"slug": cat["slug"]}):
-            continue
-        db[COLLECTIONS["categories"]].insert_one({**cat, "created_at": now()})
-        inserted += 1
+        row = insert_returning(
+            db,
+            "INSERT INTO categories (slug, name, emoji, color, created_at) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (slug) DO NOTHING RETURNING slug",
+            (cat["slug"], cat.get("name", cat["slug"]), cat.get("emoji", "🥬"), cat.get("color", "#4CAF50"), now()),
+        )
+        if row is not None:
+            inserted += 1
     return inserted
 
 
 def run(db, *, demo_users: bool = True) -> dict:
-    ensure_indexes(db)
+    ensure_schema(db)
 
     admin_email = os.getenv("ADMIN_EMAIL", "admin@agrobasket.test")
     admin_password = os.getenv("ADMIN_PASSWORD", "Admin@12345")
@@ -79,6 +78,6 @@ def run(db, *, demo_users: bool = True) -> dict:
 
 
 if __name__ == "__main__":
-    db = get_db()
-    outcome = run(db)
+    with get_conn() as db:
+        outcome = run(db)
     print("seed complete:", outcome)

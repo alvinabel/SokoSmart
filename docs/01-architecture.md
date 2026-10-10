@@ -3,7 +3,7 @@
 ## 1. System at a glance
 
 AgroBasket is a **mono-repo** with three deployable services plus a shared Python library.
-Requests fan out from the React PWA to two independent backends that share one MongoDB.
+Requests fan out from the React PWA to two independent backends that share one PostgreSQL database.
 
 ```
                         ┌──────────────────────────────┐
@@ -25,7 +25,7 @@ Requests fan out from the React PWA to two independent backends that share one M
             └──────────────┬───────────────┘
                            ▼
                  ┌───────────────────┐
-                 │   MongoDB          │
+                 │   PostgreSQL       │
                  │   db: agrobasket   │
                  └───────────────────┘
 ```
@@ -56,7 +56,8 @@ shared/
   roles.py         Role enum + PERMISSIONS matrix + user_has()
   errors.py        ApiError hierarchy → consistent JSON
   categories.py    canonical agri categories (seed + UI fallback)
-  mongo.py         pymongo client + ensure_indexes() + COLLECTIONS registry
+  db.py            psycopg3 connection pool + query helpers (fetch/execute)
+  schema.py        idempotent Postgres DDL + ensure_schema()/truncate_all()
 
 backend/
   app.py                 WSGI entry (gunicorn: `app:app`)
@@ -69,12 +70,12 @@ backend/
 api/
   main.py                ASGI entry (`main:app`)
   app/api.py             create_app() — routers, CORS, exception handlers
-  app/core/mongo.py      Motor async client + db dependency
+  app/core/db.py         pooled psycopg connection + get_db dependency
   app/core/types.py      shared enum/constant strings
   app/dependencies.py    get_current_user, require_permission
   app/schemas/*.py       Pydantic request/response models
   app/routers/*.py       thin HTTP layer
-  app/services/*.py      business logic operating on Mongo collections
+  app/services/*.py      business logic operating on Postgres tables (SQL)
   seed.py                demo listings/orders (uses shared categories)
 
 frontend/
@@ -87,7 +88,7 @@ frontend/
   vite.config.js       vite-plugin-pwa manifest + Workbox caching
 ```
 
-**Rule of thumb:** routers/controllers never talk to Mongo directly in FastAPI — they call a
+**Rule of thumb:** routers/controllers never talk to the database directly in FastAPI — they call a
 *service*. In Flask the auth/admin services play the same role. This keeps HTTP concerns
 (auth, serialization, status codes) separate from business rules.
 
@@ -120,9 +121,9 @@ accepted by FastAPI without a network call.
 
 ---
 
-## 4. Data model (MongoDB collections)
+## 4. Data model (PostgreSQL tables)
 
-| Collection | Purpose | Key fields |
+| Table | Purpose | Key fields |
 |---|---|---|
 | `users` | accounts + role + profile | `email`(unique), `password_hash`, `role`, `name`, `phone`, `location`, `status` |
 | `refresh_tokens` | revocable refresh registry | `jti`(unique, TTL), `user`, `revoked` |
@@ -136,22 +137,22 @@ accepted by FastAPI without a network call.
 | `messages` | chat | `conversation` (sorted id pair), `sender`, `recipient`, `body`, `created_at` |
 | `audit_logs` | admin actions | `actor`, `action`, `target`, `created_at` |
 
-Indexes are declared once in `shared/mongo.py → ensure_indexes()` (text index on listings for
-keyword search; compound/unique indexes elsewhere) and applied on service boot and by seeders.
+Schema and indexes are declared once in `shared/schema.py` (`ensure_schema()`, applied on service
+boot, by seeders and by the test harness) and mirrored in `supabase/schema.sql`.
 
 ---
 
 ## 5. Request lifecycle (example: create a listing)
 
 ```
-PWA                     FastAPI                     MongoDB
+PWA                     FastAPI                     PostgreSQL
  │  POST /api/v1/listings  │                             │
  │  Bearer <access>        │                             │
  ├────────────────────────▶│                             │
  │                         │ get_current_user() → decode JWT, load user
  │                         │ require_permission("listing.manage")
  │                         │ validate body (Pydantic ListingCreate)
- │                         │ services.listings.create() ─▶ listings.insert_one
+ │                         │ services.listings.create() ─▶ INSERT INTO listings
  │                         │ create notification (optional) ─▶ notifications
  │◀──────── 201 listing ───┤                             │
 ```

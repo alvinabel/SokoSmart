@@ -1,17 +1,45 @@
 """Serialization helpers shared by every service.
 
 Always return JSON-safe primitives (str ids, plain dicts, ISO timestamps).
+
+Rows are fetched with columns aliased back to the original document field names
+(``id AS _id``, ``seller_id AS seller``, ...) so these helpers stay stable.
 """
 
 from __future__ import annotations
 
-from bson import ObjectId
-from pymongo import DESCENDING
+from shared.db import fetch_one
 
-from shared.mongo import COLLECTIONS
+USER_COLS = "id AS _id, name, email, role, phone, bio, location, status, verified, rating, created_at"
+LISTING_COLS = (
+    "id AS _id, title, description, category, price, unit, quantity, quality, "
+    "location, images, seller_id AS seller, status, views, sold_price, created_at, updated_at"
+)
+ORDER_COLS = (
+    "id AS _id, listing_id AS listing, buyer_id AS buyer, seller_id AS seller, "
+    "quantity, unit_price, total, note, status, history, created_at, updated_at"
+)
 
 
-def public_id(value: ObjectId) -> str:
+def get_user(db, user_id) -> dict | None:
+    if not user_id:
+        return None
+    return fetch_one(db, f"SELECT {USER_COLS} FROM users WHERE id = %s", (user_id,))
+
+
+def get_listing_row(db, listing_id) -> dict | None:
+    if not listing_id:
+        return None
+    return fetch_one(db, f"SELECT {LISTING_COLS} FROM listings WHERE id = %s", (listing_id,))
+
+
+def get_order_row(db, order_id) -> dict | None:
+    if not order_id:
+        return None
+    return fetch_one(db, f"SELECT {ORDER_COLS} FROM orders WHERE id = %s", (order_id,))
+
+
+def public_id(value) -> str:
     return str(value)
 
 
@@ -37,7 +65,7 @@ def user_summary(user: dict | None) -> dict:
 
 
 def category_meta(db, slug: str) -> dict:
-    cat = db[COLLECTIONS["categories"]].find_one({"slug": slug})
+    cat = fetch_one(db, "SELECT slug, name, emoji, color FROM categories WHERE slug = %s", (slug,))
     return {
         "slug": slug,
         "name": cat["name"] if cat else slug.title(),
@@ -49,7 +77,7 @@ def category_meta(db, slug: str) -> dict:
 def listing_public(db, listing: dict) -> dict:
     """Full listing shape for detail & list views (joins seller + category)."""
     cat = category_meta(db, listing.get("category", ""))
-    seller = db[COLLECTIONS["users"]].find_one({"_id": listing.get("seller")})
+    seller = get_user(db, listing.get("seller"))
     return {
         "id": public_id(listing["_id"]),
         "title": listing.get("title", ""),
@@ -84,9 +112,9 @@ def listing_snapshot(db, listing: dict | None) -> dict | None:
 
 
 def order_public(db, order: dict) -> dict:
-    buyer = db[COLLECTIONS["users"]].find_one({"_id": order.get("buyer")})
-    seller = db[COLLECTIONS["users"]].find_one({"_id": order.get("seller")})
-    listing = db[COLLECTIONS["listings"]].find_one({"_id": order.get("listing")})
+    buyer = get_user(db, order.get("buyer"))
+    seller = get_user(db, order.get("seller"))
+    listing = get_listing_row(db, order.get("listing"))
     return {
         "id": public_id(order["_id"]),
         "status": order.get("status"),
@@ -104,4 +132,5 @@ def order_public(db, order: dict) -> dict:
 
 
 def newest(field: str = "created_at"):
-    return [(field, DESCENDING)]
+    """Backwards-compatible sort helper (descending)."""
+    return [(field, -1)]

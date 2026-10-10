@@ -1,6 +1,6 @@
 """Admin business logic (dashboard stats, moderation, audit logging).
 
-Reads/writes the same Mongo collections the FastAPI marketplace service uses, so
+Reads/writes the same PostgreSQL tables the FastAPI marketplace service uses, so
 moderation actions here are immediately visible to the storefront.
 """
 
@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bson import ObjectId
+from psycopg.types.json import Json
 
 from shared.categories import CATEGORIES
+from shared.db import execute, fetch_all, fetch_one, insert_returning
 from shared.errors import Conflict, NotFound, ValidationError
-from shared.mongo import COLLECTIONS
 from shared.roles import Role
 
 LISTING_MODERATION_STATUS = {
@@ -22,21 +22,29 @@ LISTING_MODERATION_STATUS = {
     "activate": "active",
 }
 
+LISTING_COLS = (
+    "l.id AS _id, l.title, l.category, l.price, l.unit, l.quantity, l.status, "
+    "l.views, l.location, l.created_at, u.name AS seller_name"
+)
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def audit(db, actor: dict, action: str, target: dict | None = None, meta: dict | None = None) -> None:
-    db[COLLECTIONS["audit_logs"]].insert_one(
-        {
-            "actor": str(actor.get("_id")) if actor else None,
-            "actor_email": actor.get("email") if actor else None,
-            "action": action,
-            "target": target or {},
-            "meta": meta or {},
-            "created_at": now(),
-        }
+    insert_returning(
+        db,
+        "INSERT INTO audit_logs (actor, actor_email, action, target, meta, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (
+            str(actor.get("_id")) if actor else None,
+            actor.get("email") if actor else None,
+            action,
+            Json(target or {}),
+            Json(meta or {}),
+            now(),
+        ),
     )
 
 
@@ -68,27 +76,25 @@ def _paged(items, total, page, page_size) -> dict:
 # Dashboard
 # --------------------------------------------------------------------------- #
 def dashboard_stats(db) -> dict:
-    users = db[COLLECTIONS["users"]]
-    listings = db[COLLECTIONS["listings"]]
-    orders = db[COLLECTIONS["orders"]]
+    role_rows = fetch_all(db, "SELECT role, count(*) AS n FROM users GROUP BY role")
+    by_role = {role: 0 for role in Role.ALL}
+    by_role.update({r["role"]: r["n"] for r in role_rows})
 
-    by_role = {role: users.count_documents({"role": role}) for role in Role.ALL}
-
-    listing_status_counts: dict[str, int] = {}
-    category_counts: dict[str, int] = {}
-    for doc in listings.find({}, {"status": 1, "category": 1}):
-        status = doc.get("status", "active")
-        listing_status_counts[status] = listing_status_counts.get(status, 0) + 1
-        cat = doc.get("category", "uncategorized")
-        category_counts[cat] = category_counts.get(cat, 0) + 1
-
-    order_status_counts: dict[str, int] = {}
-    revenue = 0.0
-    for doc in orders.find({}, {"status": 1, "total": 1}):
-        status = doc.get("status", "placed")
-        order_status_counts[status] = order_status_counts.get(status, 0) + 1
-        if status == "completed":
-            revenue += float(doc.get("total", 0) or 0)
+    listing_status_counts = {
+        r["status"]: r["n"]
+        for r in fetch_all(db, "SELECT status, count(*) AS n FROM listings GROUP BY status")
+    }
+    category_counts = {
+        r["category"]: r["n"]
+        for r in fetch_all(db, "SELECT category, count(*) AS n FROM listings GROUP BY category")
+    }
+    order_status_counts = {
+        r["status"]: r["n"]
+        for r in fetch_all(db, "SELECT status, count(*) AS n FROM orders GROUP BY status")
+    }
+    revenue = fetch_one(
+        db, "SELECT COALESCE(sum(total), 0) AS total FROM orders WHERE status = 'completed'"
+    )["total"]
 
     cat_name = {c["slug"]: c for c in CATEGORIES}
     by_category = [
@@ -110,27 +116,38 @@ def dashboard_stats(db) -> dict:
             "status": u.get("status", "active"),
             "created_at": u.get("created_at").isoformat() if u.get("created_at") else None,
         }
-        for u in users.find().sort("created_at", -1).limit(5)
+        for u in fetch_all(
+            db,
+            "SELECT id AS _id, name, email, role, status, created_at FROM users ORDER BY created_at DESC LIMIT 5",
+        )
     ]
 
     recent_listings = [
-        serialize_listing(doc) for doc in listings.find().sort("created_at", -1).limit(8)
+        serialize_listing(doc)
+        for doc in fetch_all(
+            db,
+            f"SELECT {LISTING_COLS} FROM listings l LEFT JOIN users u ON u.id = l.seller_id "
+            "ORDER BY l.created_at DESC LIMIT 8",
+        )
     ]
 
     return {
         "users": {
-            "total": users.count_documents({}),
+            "total": fetch_one(db, "SELECT count(*) AS n FROM users")["n"],
             "by_role": by_role,
-            "active": users.count_documents({"status": {"$ne": "suspended"}}),
-            "suspended": users.count_documents({"status": "suspended"}),
+            "active": fetch_one(db, "SELECT count(*) AS n FROM users WHERE status <> 'suspended'")["n"],
+            "suspended": fetch_one(db, "SELECT count(*) AS n FROM users WHERE status = 'suspended'")["n"],
         },
         "listings": {
-            "total": listings.count_documents({}),
+            "total": fetch_one(db, "SELECT count(*) AS n FROM listings")["n"],
             "by_status": listing_status_counts,
             "by_category": by_category,
         },
-        "orders": {"total": orders.count_documents({}), "by_status": order_status_counts},
-        "revenue": round(revenue, 2),
+        "orders": {
+            "total": fetch_one(db, "SELECT count(*) AS n FROM orders")["n"],
+            "by_status": order_status_counts,
+        },
+        "revenue": round(float(revenue or 0), 2),
         "recent_users": recent_users,
         "recent_activity": recent_listings,
     }
@@ -140,17 +157,24 @@ def dashboard_stats(db) -> dict:
 # Users
 # --------------------------------------------------------------------------- #
 def list_users(db, q: str = "", role: str = "", page: int = 1, page_size: int = 20) -> dict:
-    query: dict = {}
+    where: list[str] = []
+    params: list = []
     if role:
-        query["role"] = role
+        where.append("role = %s")
+        params.append(role)
     if q:
-        query["$or"] = [
-            {"name": {"$regex": q, "$options": "i"}},
-            {"email": {"$regex": q, "$options": "i"}},
-        ]
-    coll = db[COLLECTIONS["users"]]
-    total = coll.count_documents(query)
-    cursor = coll.find(query).sort("created_at", -1).skip((page - 1) * page_size).limit(page_size)
+        where.append("(name ILIKE %s OR email ILIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like])
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+
+    total = fetch_one(db, f"SELECT count(*) AS n FROM users {clause}", tuple(params))["n"]
+    rows = fetch_all(
+        db,
+        "SELECT id AS _id, name, email, role, status, created_at FROM users "
+        f"{clause} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+        tuple(params) + (page_size, (page - 1) * page_size),
+    )
     items = [
         {
             "id": str(u["_id"]),
@@ -160,29 +184,27 @@ def list_users(db, q: str = "", role: str = "", page: int = 1, page_size: int = 
             "status": u.get("status", "active"),
             "created_at": u.get("created_at").isoformat() if u.get("created_at") else None,
         }
-        for u in cursor
+        for u in rows
     ]
     return _paged(items, total, page, page_size)
 
 
-def _active_admin_count(db, exclude_id: ObjectId | None = None) -> int:
-    query = {"role": Role.ADMIN, "status": {"$ne": "suspended"}}
+def _active_admin_count(db, exclude_id: str | None = None) -> int:
+    sql = "SELECT count(*) AS n FROM users WHERE role = %s AND status <> 'suspended'"
+    params: list = [Role.ADMIN]
     if exclude_id is not None:
-        query["_id"] = {"$ne": exclude_id}
-    return db[COLLECTIONS["users"]].count_documents(query)
+        sql += " AND id <> %s"
+        params.append(exclude_id)
+    return fetch_one(db, sql, tuple(params))["n"]
 
 
 def update_user(db, user_id: str, action: str, value: str | None, actor: dict) -> dict:
-    try:
-        oid = ObjectId(user_id)
-    except Exception as exc:
-        raise NotFound("user not found") from exc
-    user = db[COLLECTIONS["users"]].find_one({"_id": oid})
+    user = fetch_one(db, "SELECT id AS _id, role, email FROM users WHERE id = %s", (user_id,))
     if user is None:
         raise NotFound("user not found")
 
     if action == "suspend":
-        if user.get("role") == Role.ADMIN and _active_admin_count(db, oid) == 0:
+        if user.get("role") == Role.ADMIN and _active_admin_count(db, user_id) == 0:
             raise Conflict("cannot suspend the last active admin")
         update = {"status": "suspended", "updated_at": now()}
     elif action == "activate":
@@ -190,28 +212,25 @@ def update_user(db, user_id: str, action: str, value: str | None, actor: dict) -
     elif action == "role":
         if value not in Role.ALL:
             raise ValidationError("invalid role")
-        if user.get("role") == Role.ADMIN and value != Role.ADMIN and _active_admin_count(db, oid) == 0:
+        if user.get("role") == Role.ADMIN and value != Role.ADMIN and _active_admin_count(db, user_id) == 0:
             raise Conflict("cannot demote the last active admin")
         update = {"role": value, "updated_at": now()}
     else:
         raise ValidationError(f"unsupported action '{action}'")
 
-    db[COLLECTIONS["users"]].update_one({"_id": oid}, {"$set": update})
+    sets = ", ".join(f"{k} = %s" for k in update)
+    execute(db, f"UPDATE users SET {sets} WHERE id = %s", tuple(update.values()) + (user_id,))
     audit(db, actor, f"user.{action}", {"user_id": user_id, "email": user.get("email")}, {"value": value})
     return {"id": user_id, **update}
 
 
 def delete_user(db, user_id: str, actor: dict) -> None:
-    try:
-        oid = ObjectId(user_id)
-    except Exception as exc:
-        raise NotFound("user not found") from exc
-    user = db[COLLECTIONS["users"]].find_one({"_id": oid})
+    user = fetch_one(db, "SELECT id AS _id, role, email FROM users WHERE id = %s", (user_id,))
     if user is None:
         raise NotFound("user not found")
-    if user.get("role") == Role.ADMIN and _active_admin_count(db, oid) == 0:
+    if user.get("role") == Role.ADMIN and _active_admin_count(db, user_id) == 0:
         raise Conflict("cannot delete the last active admin")
-    db[COLLECTIONS["users"]].delete_one({"_id": oid})
+    execute(db, "DELETE FROM users WHERE id = %s", (user_id,))
     audit(db, actor, "user.delete", {"user_id": user_id, "email": user.get("email")})
 
 
@@ -219,45 +238,54 @@ def delete_user(db, user_id: str, actor: dict) -> None:
 # Listings
 # --------------------------------------------------------------------------- #
 def list_listings(db, q: str = "", status: str = "", page: int = 1, page_size: int = 20) -> dict:
-    query: dict = {}
+    where: list[str] = []
+    params: list = []
     if status:
-        query["status"] = status
+        where.append("l.status = %s")
+        params.append(status)
     else:
-        query["status"] = {"$ne": "deleted"}
+        where.append("l.status <> 'deleted'")
     if q:
-        query["$or"] = [
-            {"title": {"$regex": q, "$options": "i"}},
-            {"description": {"$regex": q, "$options": "i"}},
-        ]
-    coll = db[COLLECTIONS["listings"]]
-    total = coll.count_documents(query)
-    cursor = coll.find(query).sort("created_at", -1).skip((page - 1) * page_size).limit(page_size)
-    items = [serialize_listing(doc) for doc in cursor]
+        where.append("(l.title ILIKE %s OR l.description ILIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like])
+    clause = "WHERE " + " AND ".join(where)
+
+    total = fetch_one(db, f"SELECT count(*) AS n FROM listings l {clause}", tuple(params))["n"]
+    rows = fetch_all(
+        db,
+        f"SELECT {LISTING_COLS} FROM listings l LEFT JOIN users u ON u.id = l.seller_id "
+        f"{clause} ORDER BY l.created_at DESC LIMIT %s OFFSET %s",
+        tuple(params) + (page_size, (page - 1) * page_size),
+    )
+    items = [serialize_listing(doc) for doc in rows]
     return _paged(items, total, page, page_size)
 
 
 def moderate_listing(db, listing_id: str, action: str, actor: dict) -> dict:
     if action not in LISTING_MODERATION_STATUS:
         raise ValidationError(f"unsupported action '{action}'")
-    try:
-        oid = ObjectId(listing_id)
-    except Exception as exc:
-        raise NotFound("listing not found") from exc
-    listing = db[COLLECTIONS["listings"]].find_one({"_id": oid})
+    listing = fetch_one(db, "SELECT id AS _id FROM listings WHERE id = %s", (listing_id,))
     if listing is None:
         raise NotFound("listing not found")
 
     status = LISTING_MODERATION_STATUS[action]
-    db[COLLECTIONS["listings"]].update_one(
-        {"_id": oid},
-        {"$set": {"status": status, "moderated_at": now(), "moderated_by": str(actor.get("_id"))}},
+    execute(
+        db,
+        "UPDATE listings SET status = %s, moderated_at = %s, moderated_by = %s WHERE id = %s",
+        (status, now(), str(actor.get("_id")), listing_id),
     )
     audit(db, actor, f"listing.{action}", {"listing_id": listing_id}, {"status": status})
     return {"id": listing_id, "status": status}
 
 
 def list_audit_logs(db, limit: int = 30) -> list[dict]:
-    cursor = db[COLLECTIONS["audit_logs"]].find().sort("created_at", -1).limit(limit)
+    rows = fetch_all(
+        db,
+        "SELECT id AS _id, actor_email, action, target, meta, created_at FROM audit_logs "
+        "ORDER BY created_at DESC LIMIT %s",
+        (limit,),
+    )
     return [
         {
             "id": str(doc["_id"]),
@@ -267,5 +295,5 @@ def list_audit_logs(db, limit: int = 30) -> list[dict]:
             "meta": doc.get("meta", {}),
             "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
         }
-        for doc in cursor
+        for doc in rows
     ]

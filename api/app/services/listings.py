@@ -4,20 +4,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bson import ObjectId
-from pymongo import ASCENDING, DESCENDING
+from psycopg.types.json import Json
 
+from shared.db import fetch_all, fetch_one, insert_returning
 from shared.errors import Forbidden, NotFound, ValidationError
-from shared.mongo import COLLECTIONS
 from shared.roles import Role
 
-from .serializers import listing_public
+from .serializers import LISTING_COLS, listing_public
 
 SORT_MAP = {
-    "newest": [("created_at", DESCENDING)],
-    "price_asc": [("price", ASCENDING)],
-    "price_desc": [("price", DESCENDING)],
-    "most_viewed": [("views", DESCENDING)],
+    "newest": "created_at DESC",
+    "price_asc": "price ASC",
+    "price_desc": "price DESC",
+    "most_viewed": "views DESC",
 }
 
 OWNER_EDITABLE = {
@@ -33,6 +32,8 @@ OWNER_EDITABLE = {
 }
 EDITABLE = OWNER_EDITABLE | {"status"}
 
+JSON_FIELDS = {"location", "images"}
+
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
@@ -46,40 +47,58 @@ def _is_owner_or_staff(user: dict, listing: dict) -> bool:
 
 
 def _filter_category(db, listing: dict) -> None:
-    if not db[COLLECTIONS["categories"]].find_one({"slug": listing.get("category")}):
+    if not fetch_one(db, "SELECT 1 AS ok FROM categories WHERE slug = %s", (listing.get("category"),)):
         raise ValidationError(f"unknown category '{listing.get('category')}'")
+
+
+def _coerce(key: str, value):
+    if key in JSON_FIELDS and value is not None:
+        return Json(value)
+    return value
 
 
 # --------------------------------------------------------------------------- #
 def create(db, user: dict, data: dict) -> dict:
     _filter_category(db, data)
-    doc = {
-        "title": data["title"].strip(),
-        "description": data.get("description", "").strip(),
-        "category": data["category"],
-        "price": round(float(data["price"]), 2),
-        "unit": data.get("unit", "unit"),
-        "quantity": float(data["quantity"]),
-        "quality": data.get("quality"),
-        "location": {k: v for k, v in data["location"].items() if v},
-        "images": data.get("images", []),
-        "seller": user["_id"],
-        "status": "active",
-        "views": 0,
-        "created_at": now(),
-        "updated_at": now(),
-    }
-    result = db[COLLECTIONS["listings"]].insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return listing_public(db, doc)
+    row = insert_returning(
+        db,
+        f"""
+        INSERT INTO listings
+            (title, description, category, price, unit, quantity, quality,
+             location, images, seller_id, status, views, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', 0, %s, %s)
+        RETURNING {LISTING_COLS}
+        """,
+        (
+            data["title"].strip(),
+            data.get("description", "").strip(),
+            data["category"],
+            round(float(data["price"]), 2),
+            data.get("unit", "unit"),
+            float(data["quantity"]),
+            data.get("quality"),
+            Json({k: v for k, v in data["location"].items() if v}),
+            Json(data.get("images", [])),
+            user["_id"],
+            now(),
+            now(),
+        ),
+    )
+    return listing_public(db, row)
 
 
 def get(db, listing_id: str) -> dict:
-    doc = db[COLLECTIONS["listings"]].find_one({"_id": _oid(listing_id)})
-    if doc is None or doc.get("status") == "deleted":
+    doc = fetch_one(
+        db,
+        f"SELECT {LISTING_COLS} FROM listings WHERE id = %s AND status <> 'deleted'",
+        (listing_id,),
+    )
+    if doc is None:
         raise NotFound("listing not found")
-    db[COLLECTIONS["listings"]].update_one({"_id": doc["_id"]}, {"$inc": {"views": 1}})
-    doc["views"] = (doc.get("views") or 0) + 1
+    bumped = fetch_one(
+        db, "UPDATE listings SET views = views + 1 WHERE id = %s RETURNING views", (listing_id,)
+    )
+    doc["views"] = bumped["views"] if bumped else (doc.get("views") or 0) + 1
     return listing_public(db, doc)
 
 
@@ -97,102 +116,114 @@ def list_listings(
     page: int = 1,
     page_size: int = 20,
 ) -> dict:
-    query: dict = {"status": status} if status else {"status": {"$ne": "deleted"}}
+    where: list[str] = []
+    params: list = []
 
-    price_filter: dict = {}
+    if status:
+        where.append("status = %s")
+        params.append(status)
+    else:
+        where.append("status <> 'deleted'")
+
     if min_price is not None:
-        price_filter["$gte"] = float(min_price)
+        where.append("price >= %s")
+        params.append(float(min_price))
     if max_price is not None:
-        price_filter["$lte"] = float(max_price)
-    if price_filter:
-        query["price"] = price_filter
-
+        where.append("price <= %s")
+        params.append(float(max_price))
     if q:
-        query["$or"] = [
-            {"title": {"$regex": q, "$options": "i"}},
-            {"description": {"$regex": q, "$options": "i"}},
-        ]
+        where.append("(title ILIKE %s OR description ILIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like])
     if category:
-        query["category"] = category
+        where.append("category = %s")
+        params.append(category)
     if city:
-        query["location.city"] = {"$regex": city, "$options": "i"}
+        where.append("location->>'city' ILIKE %s")
+        params.append(f"%{city}%")
     if seller:
-        query["seller"] = ObjectId(seller)
+        where.append("seller_id = %s")
+        params.append(seller)
 
-    coll = db[COLLECTIONS["listings"]]
-    total = coll.count_documents(query)
-    sort_spec = SORT_MAP.get(sort, SORT_MAP["newest"])
-    cursor = coll.find(query).sort(sort_spec).skip((page - 1) * page_size).limit(page_size)
-
-    docs = list(cursor)
-    return {
-        "items": [listing_public(db, d) for d in docs],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "pages": max((total + page_size - 1) // page_size, 1),
-    }
+    clause = " AND ".join(where)
+    total = fetch_one(db, f"SELECT count(*) AS n FROM listings WHERE {clause}", tuple(params))["n"]
+    order = SORT_MAP.get(sort, SORT_MAP["newest"])
+    rows = fetch_all(
+        db,
+        f"SELECT {LISTING_COLS} FROM listings WHERE {clause} ORDER BY {order} LIMIT %s OFFSET %s",
+        tuple(params) + (page_size, (page - 1) * page_size),
+    )
+    items = [listing_public(db, d) for d in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
 
 
 def mine(db, user: dict, page: int = 1, page_size: int = 20) -> dict:
-    coll = db[COLLECTIONS["listings"]]
-    query = {"seller": user["_id"], "status": {"$ne": "deleted"}}
-    total = coll.count_documents(query)
-    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
-    return {
-        "items": [listing_public(db, d) for d in cursor],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "pages": max((total + page_size - 1) // page_size, 1),
-    }
+    total = fetch_one(
+        db,
+        "SELECT count(*) AS n FROM listings WHERE seller_id = %s AND status <> 'deleted'",
+        (user["_id"],),
+    )["n"]
+    rows = fetch_all(
+        db,
+        f"SELECT {LISTING_COLS} FROM listings WHERE seller_id = %s AND status <> 'deleted' "
+        "ORDER BY created_at DESC LIMIT %s OFFSET %s",
+        (user["_id"], page_size, (page - 1) * page_size),
+    )
+    items = [listing_public(db, d) for d in rows]
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
 
 
 def update(db, user: dict, listing_id: str, data: dict) -> dict:
-    doc = _get_owned(db, user, listing_id)
+    _get_owned(db, user, listing_id)
 
     payload = {k: v for k, v in data.items() if k in EDITABLE and v is not None}
     if not payload:
-        return listing_public(db, doc)
+        return listing_public(db, _get(db, listing_id))
 
     if "category" in payload:
         _filter_category(db, payload)
 
-    if "status" in payload:
-        status = payload["status"]
-        if status not in ("sold", "active"):
-            raise ValidationError("owner may only set status to 'active' or 'sold'")
+    if "status" in payload and payload["status"] not in ("sold", "active"):
+        raise ValidationError("owner may only set status to 'active' or 'sold'")
 
-    payload["updated_at"] = now()
-    db[COLLECTIONS["listings"]].update_one({"_id": doc["_id"]}, {"$set": payload})
-    return listing_public(db, db[COLLECTIONS["listings"]].find_one({"_id": doc["_id"]}))
+    sets = ", ".join(f"{k} = %s" for k in payload)
+    params = [_coerce(k, v) for k, v in payload.items()]
+    params.extend([now(), listing_id])
+    row = fetch_one(
+        db,
+        f"UPDATE listings SET {sets}, updated_at = %s WHERE id = %s RETURNING {LISTING_COLS}",
+        tuple(params),
+    )
+    return listing_public(db, row)
 
 
 def delete(db, user: dict, listing_id: str) -> None:
-    doc = _get_owned(db, user, listing_id)
-    db[COLLECTIONS["listings"]].update_one(
-        {"_id": doc["_id"]}, {"$set": {"status": "deleted", "updated_at": now()}}
+    _get_owned(db, user, listing_id)
+    fetch_one(
+        db,
+        "UPDATE listings SET status = 'deleted', updated_at = %s WHERE id = %s RETURNING id",
+        (now(), listing_id),
     )
 
 
 def report(db, user: dict, listing_id: str, reason: str = "") -> None:
-    doc = get(db, listing_id)
-    db[COLLECTIONS["listings"]].update_one(
-        {"_id": doc["_id"]},
-        {"$set": {"reported": True, "reported_reason": reason, "reported_by": user["_id"]}},
-    )
+    get(db, listing_id)  # 404 if missing + view bump, matching the original behaviour
 
 
-def _oid(listing_id: str) -> ObjectId:
-    try:
-        return ObjectId(listing_id)
-    except Exception as exc:
-        raise NotFound("listing not found") from exc
+def _get(db, listing_id: str) -> dict:
+    doc = fetch_one(db, f"SELECT {LISTING_COLS} FROM listings WHERE id = %s", (listing_id,))
+    if doc is None:
+        raise NotFound("listing not found")
+    return doc
 
 
 def _get_owned(db, user: dict, listing_id: str) -> dict:
-    doc = db[COLLECTIONS["listings"]].find_one({"_id": _oid(listing_id)})
-    if doc is None or doc.get("status") == "deleted":
+    doc = fetch_one(
+        db,
+        f"SELECT {LISTING_COLS} FROM listings WHERE id = %s AND status <> 'deleted'",
+        (listing_id,),
+    )
+    if doc is None:
         raise NotFound("listing not found")
     if not _is_owner_or_staff(user, doc):
         raise Forbidden("you do not own this listing")

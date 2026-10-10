@@ -43,7 +43,7 @@ P_BUYER_BASE = (
 
 
 PERMISSIONS: dict[str, tuple[str, ...]] = {
-    Role.BUYER: P_BUYER_BASE + ("order.create", "order.read", "review.create", "bid.create"),
+    Role.BUYER: P_BUYER_BASE + ("order.create", "order.read", "order.update", "review.create", "bid.create"),
     Role.SELLER: P_BUYER_BASE
     + (
         "order.create",

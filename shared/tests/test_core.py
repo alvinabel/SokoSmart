@@ -1,10 +1,9 @@
-"""Shared-library unit tests (no Mongo required)."""
+"""Shared-library unit tests (no database required)."""
 
 import os
 import sys
 
-os.environ["MONGO_TEST"] = "1"
-os.environ["JWT_SECRET"] = "test-secret"
+os.environ.setdefault("JWT_SECRET", "test-secret")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:

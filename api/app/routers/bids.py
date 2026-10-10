@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Query, status
 
-from ..core.mongo import get_db
+from ..core.db import get_db
 from ..dependencies import get_current_user, require_permission
 from ..schemas import BidCreate
 from ..schemas.bid import BidAction

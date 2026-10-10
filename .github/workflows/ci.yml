@@ -13,6 +13,25 @@ jobs:
   python:
     name: Python (shared + backend + api)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agrobasket
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agrobasket
+      JWT_SECRET: ci-secret-not-used-in-prod
+      ADMIN_EMAIL: admin@agrobasket.test
+      ADMIN_PASSWORD: Admin@12345
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

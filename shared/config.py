@@ -16,8 +16,10 @@ class BaseConfig:
         self.app_env = _env("APP_ENV", "development")
         self.debug = self.app_env != "production"
 
-        self.mongo_uri = _env("MONGO_URI", "mongodb://localhost:27017/agrobasket")
-        self.mongo_db = _env("MONGO_DB", "agrobasket")
+        self.database_url = _env(
+            "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agrobasket"
+        )
+        self.db_pool_max = int(_env("DB_POOL_MAX", "10"))
 
         self.jwt_secret = _env("JWT_SECRET", "dev-insecure-secret-change-me")
         self.jwt_algorithm = _env("JWT_ALGORITHM", "HS256")

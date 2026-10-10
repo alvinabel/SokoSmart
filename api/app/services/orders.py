@@ -14,15 +14,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from bson import ObjectId
-from pymongo import DESCENDING
+from psycopg.types.json import Json
 
+from shared.db import fetch_all, fetch_one, insert_returning
 from shared.errors import Forbidden, NotFound, ValidationError
-from shared.mongo import COLLECTIONS
 from shared.roles import Role
 
 from .notifications import notify
-from .serializers import order_public
+from .serializers import ORDER_COLS, get_listing_row, order_public
 
 # (from_status, action) -> to_status
 TRANSITIONS: dict[tuple[str, str], str] = {
@@ -56,40 +55,36 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def insert_order(
-    db,
-    listing: dict,
-    buyer_id: ObjectId,
-    seller_id: ObjectId,
-    quantity: float,
-    unit_price: float,
-    note: str = "",
-) -> dict:
-    """Low-level insert used by both ``create`` and the bid-accept flow."""
-    doc = {
-        "listing": listing["_id"],
-        "buyer": buyer_id,
-        "seller": seller_id,
-        "quantity": float(quantity),
-        "unit_price": round(float(unit_price), 2),
-        "total": round(float(quantity) * float(unit_price), 2),
-        "note": note,
-        "status": "placed",
-        "history": [{"status": "placed", "at": now().isoformat(), "by": str(buyer_id)}],
-        "created_at": now(),
-        "updated_at": now(),
-    }
-    result = db[COLLECTIONS["orders"]].insert_one(doc)
-    doc["_id"] = result.inserted_id
-    notify(db, str(seller_id), "order.new", {"order_id": str(doc["_id"]), "listing_id": str(listing["_id"])})
-    return order_public(db, doc)
+def insert_order(db, listing: dict, buyer_id: str, seller_id: str, quantity: float, unit_price: float, note: str = "") -> dict:
+    history = [{"status": "placed", "at": now().isoformat(), "by": str(buyer_id)}]
+    row = insert_returning(
+        db,
+        f"""
+        INSERT INTO orders
+            (listing_id, buyer_id, seller_id, quantity, unit_price, total, note,
+             status, history, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'placed', %s, %s, %s)
+        RETURNING {ORDER_COLS}
+        """,
+        (
+            listing["_id"],
+            buyer_id,
+            seller_id,
+            float(quantity),
+            float(unit_price),
+            round(float(quantity) * float(unit_price), 2),
+            note,
+            Json(history),
+            now(),
+            now(),
+        ),
+    )
+    notify(db, str(seller_id), "order.new", {"order_id": str(row["_id"]), "listing_id": str(listing["_id"])})
+    return order_public(db, row)
 
 
 def create(db, user: dict, listing_id: str, quantity: float, note: str = "") -> dict:
-    try:
-        listing = db[COLLECTIONS["listings"]].find_one({"_id": ObjectId(listing_id)})
-    except Exception as exc:
-        raise NotFound("listing not found") from exc
+    listing = get_listing_row(db, listing_id)
     if listing is None or listing.get("status") == "deleted":
         raise NotFound("listing not found")
     if listing.get("status") not in ("active", "sold"):
@@ -109,13 +104,21 @@ def create(db, user: dict, listing_id: str, quantity: float, note: str = "") -> 
 
 
 def list_orders(db, user: dict, side: str = "buying", status: str = "", page: int = 1, page_size: int = 20) -> dict:
-    query: dict = {"buyer" if side == "buying" else "seller": user["_id"]}
+    column = "buyer_id" if side == "buying" else "seller_id"
+    where = [f"{column} = %s"]
+    params: list = [user["_id"]]
     if status:
-        query["status"] = status
-    coll = db[COLLECTIONS["orders"]]
-    total = coll.count_documents(query)
-    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
-    items = [order_public(db, o) for o in cursor]
+        where.append("status = %s")
+        params.append(status)
+    clause = " AND ".join(where)
+
+    total = fetch_one(db, f"SELECT count(*) AS n FROM orders WHERE {clause}", tuple(params))["n"]
+    rows = fetch_all(
+        db,
+        f"SELECT {ORDER_COLS} FROM orders WHERE {clause} ORDER BY created_at DESC LIMIT %s OFFSET %s",
+        tuple(params) + (page_size, (page - 1) * page_size),
+    )
+    items = [order_public(db, o) for o in rows]
     return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
 
 
@@ -146,12 +149,16 @@ def transition(db, user: dict, order_id: str, action: str) -> dict:
             raise Forbidden("only the buyer can perform this action")
 
     new_status = TRANSITIONS[key]
-    db[COLLECTIONS["orders"]].update_one(
-        {"_id": order["_id"]},
-        {
-            "$set": {"status": new_status, "updated_at": now()},
-            "$push": {"history": {"status": new_status, "at": now().isoformat(), "by": str(user["_id"])}},
-        },
+    entry = Json([{"status": new_status, "at": now().isoformat(), "by": str(user["_id"])}])
+    row = fetch_one(
+        db,
+        f"""
+        UPDATE orders
+        SET status = %s, updated_at = %s, history = history || %s::jsonb
+        WHERE id = %s
+        RETURNING {ORDER_COLS}
+        """,
+        (new_status, now(), entry, order["_id"]),
     )
     counterparty = order["seller"] if user["_id"] == order["buyer"] else order["buyer"]
     notify(
@@ -160,14 +167,11 @@ def transition(db, user: dict, order_id: str, action: str) -> dict:
         NOTIFY_TYPE[action],
         {"order_id": str(order["_id"]), "status": new_status},
     )
-    return order_public(db, db[COLLECTIONS["orders"]].find_one({"_id": order["_id"]}))
+    return order_public(db, row)
 
 
 def _get(db, order_id: str) -> dict:
-    try:
-        order = db[COLLECTIONS["orders"]].find_one({"_id": ObjectId(order_id)})
-    except Exception as exc:
-        raise NotFound("order not found") from exc
+    order = fetch_one(db, f"SELECT {ORDER_COLS} FROM orders WHERE id = %s", (order_id,))
     if order is None:
         raise NotFound("order not found")
     return order

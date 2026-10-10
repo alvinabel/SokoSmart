@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Query, Response, status
 
-from ..core.mongo import get_db
+from ..core.db import get_db
 from ..dependencies import get_current_user, require_permission
 from ..schemas import ReviewIn
 from ..services import reviews as svc

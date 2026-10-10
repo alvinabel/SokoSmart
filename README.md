@@ -55,7 +55,7 @@ agri-marketplace/
 ├── api/                   # FastAPI service — Marketplace REST API (listings, orders, chat…)
 ├── frontend/              # React PWA — Vite + design system + app shell + pages
 ├── scripts/               # Dev/setup assistants + PWA icon generator
-├── docker-compose.yml     # One-command local environment (mongo + backend + api + frontend)
+├── docker-compose.yml     # One-command local environment (postgres + backend + api + frontend)
 └── Makefile               # Makefile + .ps1 shortcuts
 ```
 
@@ -69,7 +69,7 @@ Prerequisites: **Docker + Docker Compose v2**.
 # optional: configure secrets / admin credentials
 cp .env.example .env
 
-# build & run everything (mongo, flask, fastapi, vite)
+# build & run everything (postgres, flask, fastapi, vite)
 docker compose up --build
 
 # seed roles, admin user, categories and demo listings (idempotent — safe to re-run)
@@ -83,7 +83,7 @@ Apps once running:
 | Frontend (PWA) | http://localhost:5173 | — |
 | Flask API (auth/admin) | http://localhost:5001 | `/api/health` |
 | FastAPI marketplace | http://localhost:8000 | Swagger at `/docs`, OpenAPI at `/openapi.json` |
-| MongoDB | mongodb://localhost:27017 | database `agrobasket` |
+| PostgreSQL | postgresql://localhost:5432/agrobasket | database `agrobasket` |
 
 **Default admin** (created by seed): `admin@agrobasket.test` / `Admin@12345` — *change in `.env` before production.*
 Demo accounts: `seller@agrobasket.test` / `buyer@agrobasket.test` (same password).
@@ -105,7 +105,7 @@ cd frontend && npm install
 npm run generate:icons && npm run dev     # http://localhost:5173
 ```
 
-> Each service needs `MONGO_URI` (see its `.env.example`). Copy `.env.example` → `.env`.
+> Each service needs `DATABASE_URL` (see its `.env.example`). Copy `.env.example` → `.env`.
 
 ---
 

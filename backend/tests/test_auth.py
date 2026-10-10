@@ -1,4 +1,4 @@
-"""Auth endpoint tests against a mongomock-backed Flask test client."""
+"""Auth endpoint tests against a PostgreSQL-backed Flask test client."""
 
 import pytest
 

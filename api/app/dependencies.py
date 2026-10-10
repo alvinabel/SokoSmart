@@ -10,14 +10,14 @@ from __future__ import annotations
 from typing import Callable
 
 import jwt as pyjwt
-from bson import ObjectId
 from fastapi import Depends, Header
 
 from shared.errors import Forbidden, Unauthorized
 from shared.jwt_token import decode_token
 from shared.roles import user_has
 
-from .core.mongo import get_db
+from .core.db import get_db
+from .services.serializers import get_user
 
 
 def _user_from_bearer(authorization: str, db) -> dict | None:
@@ -26,29 +26,21 @@ def _user_from_bearer(authorization: str, db) -> dict | None:
         return None
     try:
         claims = decode_token(token, expected_type="access")
-        return db.users.find_one({"_id": ObjectId(claims["sub"])})
-    except Exception:
+    except pyjwt.PyJWTError:
         return None
+    return get_user(db, claims.get("sub"))
 
 
-def get_current_user(
-    authorization: str = Header(default=""),
-    db=Depends(get_db),
-) -> dict:
-    """Required-user dependency: 401/403 on missing, invalid or suspended accounts."""
+def get_current_user(authorization: str = Header(""), db=Depends(get_db)) -> dict:
     user = _user_from_bearer(authorization, db)
     if user is None:
-        raise Unauthorized("invalid or missing access token")
+        raise Unauthorized("invalid or expired token")
     if user.get("status") == "suspended":
         raise Forbidden("account is suspended")
     return user
 
 
-def get_optional_user(
-    authorization: str = Header(default=""),
-    db=Depends(get_db),
-) -> dict | None:
-    """Optional-user dependency: returns ``None`` for anonymous requests."""
+def get_optional_user(authorization: str = Header(""), db=Depends(get_db)) -> dict | None:
     user = _user_from_bearer(authorization, db)
     if user is None or user.get("status") == "suspended":
         return None

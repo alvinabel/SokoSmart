@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Response, status
 
-from ..core.mongo import get_db
+from ..core.db import get_db
 from ..dependencies import require_permission
 from ..schemas import CategoryCreate, CategoryUpdate
 from ..services import categories as svc

@@ -21,7 +21,7 @@ def test_health(client):
 def test_categories_seeded_on_boot(client):
     res = client.get("/api/v1/categories")
     assert res.status_code == 200
-    slugs = {c["slug"] for c in res.get_json()["items"]}
+    slugs = {c["slug"] for c in res.json()["items"]}
     assert "fruits" in slugs and "vegetables" in slugs
 
 
@@ -29,15 +29,15 @@ def test_seller_can_create_and_public_can_read(client, seller):
     _user, headers = seller
     created = client.post("/api/v1/listings", json=_sample_listing(), headers=headers)
     assert created.status_code == 201
-    listing_id = created.get_json()["id"]
+    listing_id = created.json()["id"]
 
-    listing = client.get("/api/v1/listings").get_json()
+    listing = client.get("/api/v1/listings").json()
     assert listing["total"] == 1
     assert listing["items"][0]["title"] == "Fresh Watermelon"
 
     detail = client.get(f"/api/v1/listings/{listing_id}")
     assert detail.status_code == 200
-    assert detail.get_json()["seller"]["role"] == "seller"
+    assert detail.json()["seller"]["role"] == "seller"
 
 
 def test_buyer_cannot_create_listing(client, buyer):
@@ -60,29 +60,29 @@ def test_listing_requires_valid_category(client, seller):
 def test_order_and_transition_flow(client, seller, buyer):
     _su, seller_headers = seller
     _bu, buyer_headers = buyer
-    listing_id = client.post("/api/v1/listings", json=_sample_listing(), headers=seller_headers).get_json()["id"]
+    listing_id = client.post("/api/v1/listings", json=_sample_listing(), headers=seller_headers).json()["id"]
 
     order = client.post(
         "/api/v1/orders", json={"listing_id": listing_id, "quantity": 2}, headers=buyer_headers
     )
     assert order.status_code == 201
-    order_id = order.get_json()["id"]
-    assert order.get_json()["total"] == 5000
+    order_id = order.json()["id"]
+    assert order.json()["total"] == 5000
 
     accepted = client.patch(
         f"/api/v1/orders/{order_id}", json={"action": "accept"}, headers=seller_headers
     )
-    assert accepted.get_json()["status"] == "accepted"
+    assert accepted.json()["status"] == "accepted"
 
     fulfilled = client.patch(
         f"/api/v1/orders/{order_id}", json={"action": "fulfill"}, headers=seller_headers
     )
-    assert fulfilled.get_json()["status"] == "fulfilled"
+    assert fulfilled.json()["status"] == "fulfilled"
 
     completed = client.patch(
         f"/api/v1/orders/{order_id}", json={"action": "complete"}, headers=buyer_headers
     )
-    assert completed.get_json()["status"] == "completed"
+    assert completed.json()["status"] == "completed"
 
     review = client.post(
         "/api/v1/reviews",
@@ -94,7 +94,7 @@ def test_order_and_transition_flow(client, seller, buyer):
 
 def test_buyer_cannot_order_own_listing_via_seller(client, seller):
     _u, headers = seller
-    listing_id = client.post("/api/v1/listings", json=_sample_listing(), headers=headers).get_json()["id"]
+    listing_id = client.post("/api/v1/listings", json=_sample_listing(), headers=headers).json()["id"]
     res = client.post("/api/v1/orders", json={"listing_id": listing_id, "quantity": 1}, headers=headers)
     assert res.status_code == 422
 
