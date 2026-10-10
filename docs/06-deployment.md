@@ -1,173 +1,218 @@
 # 06 · Deployment Guide
 
-Verified target: **Vercel** for the frontend PWA + container-friendly hosts for the Python APIs +
-**MongoDB Atlas** for data. Detailed instructions below, plus how to run **Docker**, and an
-honest breakdown of the "**backend on Supabase**" option.
+Verified target: **Vercel** for the frontend PWA + **Supabase** (Auth, Postgres, Storage,
+Realtime, Edge Functions) for everything else. This replaces the Python APIs + MongoDB stack;
+the old path is kept at the end as a **legacy appendix** (Path A).
+
+> **Free tier:** the entire Supabase-native path runs on free plans. See §1 for the exact
+> limits and the guardrails that keep you inside them.
 
 ---
 
-## ⚠️ First: the Supabase + MongoDB question
+## 0. Target architecture
 
-Your stack says **MongoDB**, your deployment note says **backend Supabase**. These conflict:
-
-> Supabase is a managed **PostgreSQL** backend-as-a-service (DB + Auth + Storage + Edge Functions).
-> It **cannot** run Flask/FastAPI, and it is **not** MongoDB.
-
-Two clean paths:
-
-### Path A — Keep MongoDB + Python APIs (recommended, matches this codebase)
-- **Frontend** → Vercel (static build from `frontend/dist`).
-- **Flask + FastAPI** → any container/Python host: Render, Railway, Fly.io, Google Cloud Run, AWS.
-- **Database** → MongoDB Atlas (free M0 tier).
-
-### Path B — Adopt Supabase (Postgres)
-- Replace Mongo access in `api/app/core/mongo.py` / `shared/mongo.py` with `supabase-py`.
-- Use **Supabase Auth** (email/password, OAuth) instead of the Flask JWT service, or keep Flask and
-  just swap the DB. Supabase Storage for listing images; PostgREST for CRUD; Realtime for chat.
-- This is a **rewrite of the persistence layer**, not a config change. Keep `shared/roles.py`
-  logic but enforce at Postgres level (RLS) too.
-
-This doc focuses on **Path A**; §5 gives Supabase specifics if you choose Path B.
-
----
-
-## 0. Prereqs (all paths)
-
-- GitHub repo + [Vercel](https://vercel.com) account + [MongoDB Atlas](https://www.mongodb.com/atlas) account.
-- Set `JWT_SECRET` to a long random value (e.g. `openssl rand -hex 32`) — **never** the dev default in prod.
-- Whichever host you use, after first boot run the **seeder** to create roles/admin/categories/demo data.
-
----
-
-## 1. MongoDB Atlas
-
-1. **Create cluster** → free `M0` → choose region near your hosts.
-2. **Database access**: create a user with a strong password.
-3. **Network access**: `0.0.0.0/0` (or your host IPs) — use the "Cloud Provider" option when the host is predictable.
-4. Copy the **connection string**: `mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority`.
-5. Shared env vars for both APIs:
-
-```env
-MONGO_URI=mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority
-MONGO_DB=agrobasket
-JWT_SECRET=<your-long-secret>
-CORS_ORIGINS=https://<your-app>.vercel.app
-ACCESS_TOKEN_TTL_MINUTES=30
-REFRESH_TOKEN_TTL_DAYS=7
+```
+        React PWA  ──▶  Vercel (static, HTTPS)
+             │
+             │  @supabase/supabase-js  (anon key)
+             ▼
+        Supabase  ──▶  Auth (GoTrue)      ← identity; issues the JWT
+                  ──▶  Postgres + RLS     ← data; enforced per-user via auth.uid()
+                  ──▶  Storage            ← `listings` image bucket
+                  ──▶  Realtime           ← `messages` chat channels
+                  ──▶  Edge Functions     ← business logic (orders/bids/reviews/notify)
 ```
 
+- **Auth** is the only identity source: no password hashing, no refresh-token table. The access
+  token carries `app_metadata.role`, which RLS reads via `auth.jwt()`.
+- **Data** lives in Postgres. `supabase/schema.sql` defines the tables, indexes, RLS policies and
+  the seed categories — mirroring the shapes the Python services used.
+- **Business logic** moves to Edge Functions (Deno/TS) + PostgREST (Phase B of the migration).
+- **Python (Flask/FastAPI) and MongoDB are retired** on this path.
+
 ---
 
-## 2. Frontend → Vercel (PWA)
+## 1. Free-tier limits & guardrails
 
-1. **Build locally to confirm:** `cd frontend && npm install && npm run generate:icons && npm run build` → outputs `dist/` (includes `sw.js` + `manifest.webmanifest`).
-2. Push the repo to GitHub and click **Import** in Vercel → pick `agri-marketplace/frontend`.
+| Service | Plan | Key limits | Notes |
+|---|---|---|---|
+| Supabase | Free ($0) | 500 MB DB, 1 GB Storage, 50k MAU, 5 GB egress/mo, 500k Edge-Fn calls/mo, 2M Realtime msgs, **200 Realtime peak connections**, 2 projects | **Project is paused after 7 days of inactivity**; no automated backups |
+| Vercel | Hobby ($0) | 100 GB transfer/mo, 1M edge requests, 1M function invocations | ⚠️ **Hobby is licensed for non-commercial / personal use only** |
+
+**Guardrails to stay free:**
+
+1. **Never hit the 7-day pause.** Add a tiny keep-alive. A free scheduled GitHub Actions workflow
+   (`.github/workflows/keepalive.yml`) that calls a Supabase health endpoint daily is enough:
+   ```yaml
+   on:
+     schedule: [{ cron: '0 6 * * *' }]
+   jobs:
+     ping:
+       runs-on: ubuntu-latest
+       steps:
+         - run: curl -fsS "${{ secrets.SUPABASE_URL }}/auth/v1/health"
+   ```
+2. **Keep images in Storage, not the DB.** Store public URLs in `listings.images`; never base64
+   blobs in Postgres. That keeps the DB well under 500 MB and uses the 1 GB Storage budget.
+3. **Stay under 200 concurrent Realtime connections** — fine for a single `messages` channel per
+   active user at MVP scale.
+4. **Commercial use:** a marketplace is commercial. Vercel Hobby does **not** permit that — for a
+   real launch either upgrade Vercel to Pro ($20/mo) **or** move the static build to
+   **Cloudflare Pages** (free, unlimited bandwidth, commercial use allowed). Supabase's free tier
+   *does* allow commercial use. `frontend/vercel.json` still works on Cloudflare only if converted
+   to `_redirects`/`_headers`; the config below is for Vercel.
+
+---
+
+## 2. Supabase project setup
+
+1. Create a project at [supabase.com](https://supabase.com) (free). Note the **project ref**,
+   **anon key** and **service-role key** from *Settings → API*.
+2. Open **SQL Editor** and run the entire `supabase/schema.sql`. It creates all tables, RLS
+   policies, the `handle_new_user` trigger, the seed categories, the `listings` storage bucket and
+   adds `messages` to Realtime. It is safe to re-run for the seed, but the DDL is one-time — for a
+   clean re-run, reset the project or drop the objects first.
+3. **Auth → Providers:** keep Email enabled. (Add Google/etc. later if desired.)
+4. **Auth → URL configuration:** set *Site URL* and *Redirect URLs* to your frontend origin
+   (`http://localhost:5173` for dev, `https://<app>.vercel.app` for prod).
+5. **Create the demo users** in *Authentication → Users* (or via the Admin API), passing metadata
+   so the `handle_new_user` trigger assigns the role:
+
+   | Email | Password | `user_metadata` |
+   |---|---|---|
+   | `admin@agrobasket.test` | `Admin@12345` | `{ "name": "AgroBasket Admin", "role": "admin" }` |
+   | `seller@agrobasket.test` | `Demo@12345` | `{ "name": "Demo Seller", "role": "seller", "farm_name": "Green Acres" }` |
+   | `buyer@agrobasket.test` | `Demo@12345` | `{ "name": "Demo Buyer", "role": "buyer" }` |
+
+   If a user was created without metadata, promote them afterward (the trigger syncs the role into
+   the JWT on the next sign-in):
+   ```sql
+   update public.profiles set role = 'admin' where name = 'AgroBasket Admin';
+   ```
+   **Rotate the admin password** after first login.
+
+---
+
+## 3. Environment variables
+
+**Root `.env` / server side** (Edge Functions, scripts):
+
+```env
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_ANON_KEY=<anon-public-key>
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
+SUPABASE_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+SUPABASE_STORAGE_BUCKET=listings
+```
+
+**Frontend (Vercel → Settings → Environment Variables), public:**
+
+```env
+VITE_SUPABASE_URL=https://<project-ref>.supabase.co
+VITE_SUPABASE_ANON_KEY=<anon-public-key>
+```
+
+`VITE_AUTH_API_URL` / `VITE_MARKET_API_URL` are **legacy** (used only by the Python stack below).
+
+---
+
+## 4. Frontend → Vercel (PWA)
+
+1. **Build locally to confirm:** `cd frontend && npm install && npm run generate:icons && npm run build` → `dist/` (with `sw.js` + `manifest.webmanifest`).
+2. Push the repo to GitHub and **Import** in Vercel → pick the repo → **Root directory: `frontend`**.
 3. Settings:
 
-| Setting | Value |
-|---|---|
-| Framework preset | `Vite` |
-| Root directory | `frontend` |
-| Build command | `npm run build` |
-| Install command | `npm install` |
-| Output directory | `dist` |
-| Node version | `20.x` |
+   | Setting | Value |
+   |---|---|
+   | Framework preset | `Vite` |
+   | Root directory | `frontend` |
+   | Build command | `npm run build` |
+   | Install command | `npm install` |
+   | Output directory | `dist` |
+   | Node version | `20.x` |
 
-4. **Environment variables** (Vercel project → Settings → Environment Variables):
-
-```env
-VITE_AUTH_API_URL=https://<flask-host>/api
-VITE_MARKET_API_URL=https://<api-host>/api/v1
-```
-
-5. **Deploy.** Two live URLs will work: the service worker requires the app to be served over
-   HTTPS — Vercel gives you that free.
-
-> **Vercel CLI alternative:** `npx vercel --prod` from `frontend/` (uses the same settings once linked).
+4. Add the frontend env vars from §3, then **Deploy**. The service worker needs HTTPS — Vercel
+   provides it. `frontend/vercel.json` handles the SPA fallback rewrite and cache headers
+   (`/assets/*` immutable; `index.html` + `sw.js` revalidated).
+5. **Vercel CLI alternative:** `npx vercel --prod` from `frontend/` (uses the same settings once linked).
 
 ---
 
-## 3. Python APIs → Render (or Railway)
+## 5. Edge Functions & API surface (migration target)
 
-Both backends are plain WSGI/ASGI apps; this example uses **Render web services** (free/paid).
-Railway is nearly identical — choose a "Docker" or "Python" template and add the same env vars.
+- **CRUD + authz** — read/write via `@supabase/supabase-js` (PostgREST) directly from the client;
+  RLS enforces ownership/participants so no trusted middleware is needed for simple reads/writes.
+- **Business logic** — port the state machines from `api/app/services/*` into Edge Functions:
+  - `orders` (`placed→accepted→fulfilled→completed`; reject/cancel) — see the transition table in
+    `api/app/services/orders.py`.
+  - `bids` (accept ⇒ decline siblings, create order, mark listing `sold`) — `api/app/services/bids.py`.
+  - `reviews` (require a completed order; one per listing) — `api/app/services/reviews.py`.
+  - `notifications` fan-out (types in `api/app/services/notifications.py`).
+  These run with the **service role** to bypass RLS where cross-party writes are required.
+- **Realtime chat** — subscribe to `public.messages` inserts filtered by `conversation`; replaces
+  the REST polling in `pages/Inbox.jsx`.
 
-### 3.1 Flask (`backend/`)
+---
 
-1. Render → New Web Service → point at repo → **Root directory:** `backend`.
-2. Build: `pip install -r requirements.txt` • Start command: `gunicorn app:app -b 0.0.0.0:$PORT` (Render injects `$PORT`; our Docker port override is `5001`).
-   If using Docker deploys, render uses `backend/Dockerfile` which already runs gunicorn on `$PORT`.
-3. Add env vars from §1.
+## 6. Legacy appendix — Path A (Python + MongoDB)
 
-### 3.2 FastAPI (`api/`)
+Kept for reference if you ever need to run the original stack. Both APIs are plain WSGI/ASGI apps;
+the example below uses **Render** (free tier spins down after 15 min idle) and **MongoDB Atlas**.
 
-1. New Web Service → root dir `api`.
-2. Build: `pip install -r requirements.txt` • Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT` (Dockerfile also works).
-3. Add env vars from §1.
-4. Enable the **health check** at `/api/health` and `/docs` to confirm boot.
+### 6.1 MongoDB Atlas
+1. Create a free `M0` cluster near your hosts; create a DB user; allow access (`0.0.0.0/0` or host IPs).
+2. Connection string: `mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority`.
+3. Shared env for both APIs:
+   ```env
+   MONGO_URI=mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority
+   MONGO_DB=agrobasket
+   JWT_SECRET=<your-long-secret>
+   CORS_ORIGINS=https://<your-app>.vercel.app
+   ACCESS_TOKEN_TTL_MINUTES=30
+   REFRESH_TOKEN_TTL_DAYS=7
+   ```
 
-### 3.3 Seed production data
+### 6.2 Flask (`backend/`)
+Render → New Web Service → repo → **Root directory `backend`**; build `pip install -r requirements.txt`;
+start `gunicorn app:app -b 0.0.0.0:$PORT` (or use `backend/Dockerfile`). Add the env vars above.
 
+### 6.3 FastAPI (`api/`)
+New Web Service → root dir `api`; build `pip install -r requirements.txt`;
+start `uvicorn main:app --host 0.0.0.0 --port $PORT`. Health check `/api/health`, docs at `/docs`.
+
+### 6.4 Seed
 ```bash
-# after each API is live, run (once) from your machine or a one-off container:
 MONGO_URI="mongodb+srv://..." ADMIN_EMAIL="..." ADMIN_PASSWORD="..." python infra/seed_all.py
 ```
 
-Rotate the admin password afterwards, or keep it safe in a password manager — it's the superuser.
-
----
-
-## 4. Docker deployment (self-hosted alternative)
-
-Ships the full stack via `docker-compose.yml`. For a server (e.g. a VPS with 1–2 GB RAM):
-
+### 6.5 Docker (self-hosted)
 ```bash
 git clone <repo> agri-marketplace && cd agri-marketplace
-cp .env.example .env   # set real secrets + MONGO_URI to Atlas (the mongo service is optional)
+cp .env.example .env   # set real secrets; point MONGO_URI at Atlas (the mongo service is optional)
 docker compose up -d --build
 ```
 
-To run without a local Mongo (Atlas at the edge): remove/scale the `mongo` block and point
-`MONGO_URI` at Atlas.
-
-Behind a reverse proxy (Caddy/Nginx/Traefik) add TLS; set `CORS_ORIGINS` to the real frontend URL.
-
 ---
 
-## 5. Supabase alternative (Path B, summary)
-
-| Concern | Trade-off vs MongoDB path |
-|---|---|
-| Auth | Use Supabase Auth (JWT `sub` = Supabase user) — adapt `shared/jwt_token.py` to verify Supabase JWTs (`anon/public` key), or keep Flask minting its own tokens and store user rows in Postgres. |
-| DB | Tables `users, listings, orders, bids, reviews, messages, notifications`. Enable **Row Level Security**: sellers edit their rows, buyers read active listings. Port index logic to Postgres indexes. |
-| Realtime chat | `supabase-js` channels replace the REST polling in `pages/Inbox.jsx`. |
-| Storage (listings images) | Supabase Storage public bucket + signed URLs instead of image-URL fields. |
-| Python | Use `supabase-py` (sync, PostgREST) in FastAPI; Flask admin stays but reads Postgres. |
-| Deploy | Frontend still Vercel; Edge Functions/PG can host lightweight logic, but Flask+FastAPI still need a host (Render/Railway). |
-
-**Recommendation:** unless you specifically want managed Postgres + PostgREST, Path A is far less work.
-
----
-
-## 6. PWA release checklist
+## 7. PWA release checklist
 
 - [ ] `npm run generate:icons` ran → `/public/icons/{192,512,maskable,apple-touch}.png` exist.
 - [ ] Production build served over **HTTPS** (Vercel default).
-- [ ] Manifest ✓ (`name`, `short_name`, `start_url /`, `display standalone`, `theme_color #F4435E`, icons incl. `purpose: any` + maskable).
+- [ ] Manifest ✓ (`name`, `short_name`, `start_url /`, `display standalone`, `theme_color #F4435E`, icons incl. maskable).
 - [ ] Lighthouse PWA audit ≥ 90 on installability + offline.
 - [ ] Test install on iOS Safari (add-to-home-screen) and Android Chrome (beforeinstallprompt).
 - [ ] Service worker auto-update confirmed (`registerType: autoUpdate`) + an update toast.
-- [ ] Push notifications: add VAPID keys + `/api/v1/push` subscription endpoint (scaffold-ready).
+- [ ] Push notifications: add VAPID keys + a subscription endpoint (scaffold-ready).
 
 ---
 
-## 7. Environment matrix
+## 8. Environment matrix
 
-| Env | Frontend (Vercel) | Flask | FastAPI | Mongo |
-|---|---|---|---|---|
-| `development` | http://localhost:5173 | localhost:5001 | localhost:8000 | docker `mongo:7` |
-| `staging` | vercel preview | Render .internal | Render .internal | Atlas shared |
-| `production` | vercel.com domain | Render | Render | Atlas M0+ |
+| Env | Frontend | Supabase | Legacy Flask | Legacy FastAPI | Legacy Mongo |
+|---|---|---|---|---|---|
+| `development` | http://localhost:5173 | cloud project (free) | localhost:5001 | localhost:8000 | docker `mongo:7` |
+| `staging` | Vercel preview | staging project | — | — | — |
+| `production` | Vercel domain (or Cloudflare Pages) | prod project | — | — | — |
 
-Keep `JWT_SECRET` identical across Flask and FastAPI **in the same environment** and different
-between environments.
+On the Supabase-native path, `JWT_SECRET` is only relevant to the legacy Python stack; the new
+identity layer is Supabase Auth and its JWT signing keys.
