@@ -159,6 +159,11 @@ VITE_SUPABASE_ANON_KEY=<anon-public-key>
 Kept for reference if you ever need to run the original stack. Both APIs are plain WSGI/ASGI apps;
 the example below uses **Render** (free tier spins down after 15 min idle) and **MongoDB Atlas**.
 
+**One-file deploy:** `render.yaml` at the repo root defines both services (blueprint). Use
+Render → **New → Blueprint** → connect this repo, fill the `sync: false` secrets (`MONGO_URI`,
+`JWT_SECRET` — identical on both services, `CORS_ORIGINS`, `ADMIN_PASSWORD`), and Render builds,
+deploys and seeds both APIs from that single file.
+
 ### 6.1 MongoDB Atlas
 1. Create a free `M0` cluster near your hosts; create a DB user; allow access (`0.0.0.0/0` or host IPs).
 2. Connection string: `mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority`.

@@ -1,0 +1,79 @@
+# Render blueprint — deploys BOTH Python services from one file.
+# Repo root: agro-marketplace (current repo).
+#
+# Usage:
+#   1. render.com -> New -> Blueprint -> connect this GitHub repo.
+#   2. When prompted, fill the `sync: false` variables (secrets):
+#        MONGO_URI        - Atlas connection string
+#        JWT_SECRET       - MUST be identical on both services (set the same value)
+#        CORS_ORIGINS     - https://<your-app>.vercel.app
+#   3. First deploy of `backend` seeds admin/demo data (idempotent, on every boot).
+#
+# Register a demo account at https://<app>.vercel.app after the first boot.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Flask — identity + admin (also seeds on boot)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: agrobasket-backend
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: sh -c "python ../infra/seed_all.py || true; exec gunicorn app:app -b 0.0.0.0:$PORT --workers 2"
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: agrobasket
+      - key: JWT_SECRET
+        sync: false
+      - key: ACCESS_TOKEN_TTL_MINUTES
+        value: "30"
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "7"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ADMIN_EMAIL
+        value: admin@agrobasket.test
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SEED_DEMO_USERS
+        value: "true"
+      - key: SEED_DEMO_ITEMS
+        value: "true"
+
+  # ---------------------------------------------------------------------------
+  # FastAPI — marketplace REST API
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: agrobasket-api
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: agrobasket
+      - key: JWT_SECRET
+        sync: false
+      - key: ACCESS_TOKEN_TTL_MINUTES
+        value: "30"
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: "7"
+      - key: CORS_ORIGINS
+        sync: false
