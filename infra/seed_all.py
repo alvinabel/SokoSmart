@@ -1,7 +1,7 @@
 """One-shot idempotent seeder used by ``docker compose --profile tools run seed``.
 
 Runs every seed module in order:
-  1. Postgres schema (shared/schema.py)
+  1. Mongo indexes (shared/mongo.py)
   2. backend/seed.py   -> admin, demo users, categories
   3. api/seed.py       -> demo listings
 
@@ -15,21 +15,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import api.seed  # noqa: E402
 import backend.seed  # noqa: E402
-from shared.db import get_conn  # noqa: E402
-from shared.schema import ensure_schema  # noqa: E402
+import api.seed  # noqa: E402
+from shared.mongo import ensure_indexes, get_db  # noqa: E402
 
 
 def main() -> int:
-    with get_conn() as db:
-        ensure_schema(db)
+    db = get_db()
+    ensure_indexes(db)
 
-        identity = backend.seed.run(db, demo_users=os.getenv("SEED_DEMO_USERS", "true").lower() in ("1", "true"))
-        print("[backend.seed]", identity)
+    identity = backend.seed.run(db, demo_users=os.getenv("SEED_DEMO_USERS", "true").lower() in ("1", "true"))
+    print("[backend.seed]", identity)
 
-        market = api.seed.run(db)
-        print("[api.seed]", market)
+    market = api.seed.run(db)
+    print("[api.seed]", market)
 
     for key, result in (("backend", identity), ("api", market)):
         if isinstance(result, dict) and result.get("reason"):

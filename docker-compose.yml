@@ -1,18 +1,18 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: agro_postgres
+  mongo:
+    image: mongo:7
+    container_name: agro_mongo
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-agrobasket}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agrobasket}
-      POSTGRES_DB: ${POSTGRES_DB:-agrobasket}
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-agrobasket}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-mongoroot}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-mongorootpass}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${MONGO_PORT:-27017}:27017"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mongo_data:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agrobasket} -d ${POSTGRES_DB:-agrobasket}"]
+      test: echo 'db.runCommand("ping").ok' | mongosh mongodb://localhost:27017/agrobasket --quiet
       interval: 5s
       timeout: 5s
       retries: 12
@@ -25,8 +25,8 @@ services:
     container_name: agro_backend
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://agrobasket:agrobasket@postgres:5432/agrobasket}
-      DB_POOL_MAX: ${DB_POOL_MAX:-10}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
       JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
@@ -37,7 +37,7 @@ services:
     ports:
       - "${BACKEND_PORT:-5001}:5001"
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
 
   # FastAPI — marketplace REST API
@@ -48,8 +48,8 @@ services:
     container_name: agro_api
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://agrobasket:agrobasket@postgres:5432/agrobasket}
-      DB_POOL_MAX: ${DB_POOL_MAX:-10}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
       JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
@@ -58,7 +58,7 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
 
   # Frontend — Vite dev server (PWA). For production, build and deploy to Vercel.
@@ -83,17 +83,16 @@ services:
     container_name: agro_seed
     entrypoint: ["python", "infra/seed_all.py"]
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://agrobasket:agrobasket@postgres:5432/agrobasket}
-      DB_POOL_MAX: ${DB_POOL_MAX:-10}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/agrobasket}
+      MONGO_DB: ${MONGO_DB:-agrobasket}
       JWT_SECRET: ${JWT_SECRET:-dev-insecure-secret}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@agrobasket.test}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
-      SEED_DEMO_USERS: ${SEED_DEMO_USERS:-true}
       SEED_DEMO_ITEMS: ${SEED_DEMO_ITEMS:-true}
     profiles: ["tools"]
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
 
 volumes:
-  postgres_data:
+  mongo_data:

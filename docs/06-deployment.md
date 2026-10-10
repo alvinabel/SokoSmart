@@ -154,26 +154,23 @@ VITE_SUPABASE_ANON_KEY=<anon-public-key>
 
 ---
 
-## 6. Python stack deploy — Flask + FastAPI + Supabase Postgres
+## 6. Legacy appendix — Path A (Python + MongoDB)
 
-The production architecture keeps the two Python services and uses **Supabase** purely as a
-managed **PostgreSQL** database (credentials live in `users.password_hash`; sessions in
-`refresh_tokens`). Both APIs are plain WSGI/ASGI apps; the example below uses **Render** (free tier
-spins down after 15 min idle), **Supabase Postgres** for the database and **Vercel** for the PWA.
+Kept for reference if you ever need to run the original stack. Both APIs are plain WSGI/ASGI apps;
+the example below uses **Render** (free tier spins down after 15 min idle) and **MongoDB Atlas**.
 
 **One-file deploy:** `render.yaml` at the repo root defines both services (blueprint). Use
-Render → **New → Blueprint** → connect this repo, fill the `sync: false` secrets (`DATABASE_URL`,
+Render → **New → Blueprint** → connect this repo, fill the `sync: false` secrets (`MONGO_URI`,
 `JWT_SECRET` — identical on both services, `CORS_ORIGINS`, `ADMIN_PASSWORD`), and Render builds,
 deploys and seeds both APIs from that single file.
 
-### 6.1 Supabase Postgres
-1. Create a free Supabase project; copy the **connection string** (Project Settings → Database).
-   For the seed/server (non-pooled) port use `db.<project-ref>.supabase.co:5432`.
-2. Run `supabase/schema.sql` in the Supabase SQL editor (or it is applied automatically on boot).
+### 6.1 MongoDB Atlas
+1. Create a free `M0` cluster near your hosts; create a DB user; allow access (`0.0.0.0/0` or host IPs).
+2. Connection string: `mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority`.
 3. Shared env for both APIs:
    ```env
-   DATABASE_URL=postgresql://postgres:<password>@db.<project-ref>.supabase.co:5432/postgres
-   DB_POOL_MAX=10
+   MONGO_URI=mongodb+srv://<user>:<pass>@<cluster>/agrobasket?retryWrites=true&w=majority
+   MONGO_DB=agrobasket
    JWT_SECRET=<your-long-secret>
    CORS_ORIGINS=https://<your-app>.vercel.app
    ACCESS_TOKEN_TTL_MINUTES=30
@@ -190,13 +187,13 @@ start `uvicorn main:app --host 0.0.0.0 --port $PORT`. Health check `/api/health`
 
 ### 6.4 Seed
 ```bash
-DATABASE_URL="postgresql://..." ADMIN_EMAIL="..." ADMIN_PASSWORD="..." python infra/seed_all.py
+MONGO_URI="mongodb+srv://..." ADMIN_EMAIL="..." ADMIN_PASSWORD="..." python infra/seed_all.py
 ```
 
 ### 6.5 Docker (self-hosted)
 ```bash
 git clone <repo> agri-marketplace && cd agri-marketplace
-cp .env.example .env   # set real secrets; point DATABASE_URL at Supabase (the postgres service is optional)
+cp .env.example .env   # set real secrets; point MONGO_URI at Atlas (the mongo service is optional)
 docker compose up -d --build
 ```
 
@@ -216,11 +213,11 @@ docker compose up -d --build
 
 ## 8. Environment matrix
 
-| Env | Frontend | Supabase | Flask | FastAPI | Postgres |
+| Env | Frontend | Supabase | Legacy Flask | Legacy FastAPI | Legacy Mongo |
 |---|---|---|---|---|---|
-| `development` | http://localhost:5173 | cloud project (free) | localhost:5001 | localhost:8000 | docker `postgres:16` |
+| `development` | http://localhost:5173 | cloud project (free) | localhost:5001 | localhost:8000 | docker `mongo:7` |
 | `staging` | Vercel preview | staging project | — | — | — |
 | `production` | Vercel domain (or Cloudflare Pages) | prod project | — | — | — |
 
-The identity layer is the Flask service's JWT (`shared/jwt_token.py`); `JWT_SECRET` must be the
-same value on both Python services. Supabase is used only as managed PostgreSQL.
+On the Supabase-native path, `JWT_SECRET` is only relevant to the legacy Python stack; the new
+identity layer is Supabase Auth and its JWT signing keys.

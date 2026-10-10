@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, status
 
-from ..core.db import get_db
+from ..core.mongo import get_db
 from ..dependencies import get_current_user
 from ..schemas import BecomeSeller, ProfileUpdate
 from ..services import profile as svc

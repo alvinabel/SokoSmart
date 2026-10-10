@@ -9,16 +9,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from shared.db import execute, fetch_all, fetch_one, insert_returning
+from bson import ObjectId
+from pymongo import DESCENDING
+
 from shared.errors import NotFound, ValidationError
+from shared.mongo import COLLECTIONS
 
 from .notifications import notify
-from .serializers import get_user, user_summary
-
-MSG_COLS = (
-    "id AS _id, conversation, sender_id AS sender, recipient_id AS recipient, "
-    "body, listing_id, read, created_at"
-)
+from .serializers import user_summary
 
 
 def now() -> datetime:
@@ -42,7 +40,10 @@ def _public(msg: dict) -> dict:
 
 
 def _get_user(db, user_id: str) -> dict:
-    user = get_user(db, user_id)
+    try:
+        user = db[COLLECTIONS["users"]].find_one({"_id": ObjectId(user_id)})
+    except Exception as exc:
+        raise NotFound("user not found") from exc
     if user is None:
         raise NotFound("user not found")
     return user
@@ -53,36 +54,34 @@ def send(db, user: dict, recipient_id: str, body: str, listing_id: str | None = 
     if recipient["_id"] == user["_id"]:
         raise ValidationError("cannot message yourself")
 
-    row = insert_returning(
-        db,
-        f"""
-        INSERT INTO messages (conversation, sender_id, recipient_id, body, listing_id, read, created_at)
-        VALUES (%s, %s, %s, %s, %s, false, %s)
-        RETURNING {MSG_COLS}
-        """,
-        (conversation_id(user["_id"], recipient["_id"]), user["_id"], recipient["_id"], body.strip(), listing_id, now()),
-    )
+    doc = {
+        "conversation": conversation_id(user["_id"], recipient["_id"]),
+        "sender": user["_id"],
+        "recipient": recipient["_id"],
+        "body": body.strip(),
+        "listing_id": ObjectId(listing_id) if listing_id else None,
+        "read": False,
+        "created_at": now(),
+    }
+    result = db[COLLECTIONS["messages"]].insert_one(doc)
+    doc["_id"] = result.inserted_id
     notify(db, str(recipient["_id"]), "message.new", {"from": str(user["_id"])})
-    return _public(row)
+    return _public(doc)
 
 
 def thread(db, user: dict, other_id: str, page: int = 1, page_size: int = 50) -> dict:
     other = _get_user(db, other_id)
     conv = conversation_id(user["_id"], other["_id"])
-    total = fetch_one(db, "SELECT count(*) AS n FROM messages WHERE conversation = %s", (conv,))["n"]
+    coll = db[COLLECTIONS["messages"]]
+    query = {"conversation": conv}
+    total = coll.count_documents(query)
 
-    execute(
-        db,
-        "UPDATE messages SET read = true WHERE conversation = %s AND recipient_id = %s AND read = false",
-        (conv, user["_id"]),
+    coll.update_many(
+        {"conversation": conv, "recipient": user["_id"], "read": False}, {"$set": {"read": True}}
     )
 
-    rows = fetch_all(
-        db,
-        f"SELECT {MSG_COLS} FROM messages WHERE conversation = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (conv, page_size, (page - 1) * page_size),
-    )
-    items = [_public(m) for m in reversed(rows)]
+    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
+    items = [_public(m) for m in reversed(list(cursor))]
     return {
         "conversation_id": conv,
         "with": user_summary(other),
@@ -96,19 +95,18 @@ def thread(db, user: dict, other_id: str, page: int = 1, page_size: int = 50) ->
 
 def inbox(db, user: dict, limit: int = 500) -> dict:
     """Latest message per counterparty + unread count (computed in Python for MVP scale)."""
-    rows = fetch_all(
-        db,
-        f"SELECT {MSG_COLS} FROM messages WHERE sender_id = %s OR recipient_id = %s "
-        "ORDER BY created_at DESC LIMIT %s",
-        (user["_id"], user["_id"], limit),
-    )
+    coll = db[COLLECTIONS["messages"]]
+    query = {"$or": [{"sender": user["_id"]}, {"recipient": user["_id"]}]}
+    messages = list(coll.find(query).sort("created_at", DESCENDING).limit(limit))
 
     conversations: dict[str, dict] = {}
-    for msg in rows:
+    unread: dict[str, int] = {}
+    for msg in messages:
+        conv = msg["conversation"]
         other_id = msg["recipient"] if msg["sender"] == user["_id"] else msg["sender"]
         key = str(other_id)
         if key not in conversations:
-            other = get_user(db, other_id)
+            other = db[COLLECTIONS["users"]].find_one({"_id": other_id})
             conversations[key] = {
                 "with": user_summary(other),
                 "last_message": msg.get("body", ""),

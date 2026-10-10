@@ -1,15 +1,16 @@
-"""Favorites domain — one per (user, listing) pair."""
+"""Favorites domain — one (user, listing) pair."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from shared.db import execute, fetch_all, fetch_one
+from bson import ObjectId
+from pymongo import DESCENDING
+
 from shared.errors import NotFound
+from shared.mongo import COLLECTIONS
 
-from .serializers import LISTING_COLS, get_listing_row, listing_snapshot
-
-FAV_COLS = "id AS _id, user_id AS user, listing_id AS listing, created_at"
+from .listings import get
 
 
 def now() -> datetime:
@@ -17,38 +18,36 @@ def now() -> datetime:
 
 
 def toggle(db, user: dict, listing_id: str) -> dict:
-    listing = get_listing_row(db, listing_id)
-    if listing is None:
-        raise NotFound("listing not found")
-    existing = fetch_one(db, f"SELECT {FAV_COLS} FROM favorites WHERE user_id = %s AND listing_id = %s", (user["_id"], listing_id))
+    get(db, listing_id)  # 404 guard
+    pair = {"user": user["_id"], "listing": ObjectId(listing_id)}
+    existing = db[COLLECTIONS["favorites"]].find_one(pair)
     if existing:
-        execute(db, "DELETE FROM favorites WHERE id = %s", (existing["_id"],))
+        db[COLLECTIONS["favorites"]].delete_one({"_id": existing["_id"]})
         return {"favorited": False}
-    execute(
-        db,
-        "INSERT INTO favorites (user_id, listing_id, created_at) VALUES (%s, %s, %s)",
-        (user["_id"], listing_id, now()),
-    )
+    db[COLLECTIONS["favorites"]].insert_one({**pair, "created_at": now()})
     return {"favorited": True}
 
 
 def list_favorites(db, user: dict, page: int = 1, page_size: int = 20) -> dict:
-    total = fetch_one(db, "SELECT count(*) AS n FROM favorites WHERE user_id = %s", (user["_id"],))["n"]
-    rows = fetch_all(
-        db,
-        f"SELECT {FAV_COLS} FROM favorites WHERE user_id = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (user["_id"], page_size, (page - 1) * page_size),
-    )
+    coll = db[COLLECTIONS["favorites"]]
+    query = {"user": user["_id"]}
+    total = coll.count_documents(query)
+    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
     items = []
-    for fav in rows:
-        listing = fetch_one(db, f"SELECT {LISTING_COLS} FROM listings WHERE id = %s", (fav["listing"],))
-        if listing is None or listing.get("status") == "deleted":
-            continue
-        items.append(
-            {
-                "id": str(fav["_id"]),
-                "listing": listing_snapshot(db, listing),
-                "created_at": fav.get("created_at").isoformat() if fav.get("created_at") else None,
-            }
-        )
+    for fav in cursor:
+        listing = db[COLLECTIONS["listings"]].find_one({"_id": fav["listing"]})
+        if listing and listing.get("status") != "deleted":
+            items.append(
+                {
+                    "id": str(fav["_id"]),
+                    "favorited_at": fav.get("created_at").isoformat() if fav.get("created_at") else None,
+                    "listing": _snapshot(db, listing),
+                }
+            )
     return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
+
+
+def _snapshot(db, listing: dict) -> dict:
+    from .serializers import listing_snapshot
+
+    return listing_snapshot(db, listing)

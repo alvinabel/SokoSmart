@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from psycopg.types.json import Json
+from bson import ObjectId
+from pymongo import DESCENDING
 
-from shared.db import execute, fetch_all, fetch_one, insert_returning
 from shared.errors import NotFound
-
-NOTIF_COLS = "id AS _id, recipient_id AS recipient, type, read, data, created_at"
+from shared.mongo import COLLECTIONS
 
 VALID_TYPES = {
     "order.new",
@@ -32,14 +31,21 @@ def now() -> datetime:
 
 
 def notify(db, recipient_id: str, type_: str, data: dict | None = None) -> None:
-    """Insert a notification. Silently ignores missing recipients."""
+    """Insert a notification. Silently ignores self-notifications."""
     if not recipient_id:
         return
-    insert_returning(
-        db,
-        "INSERT INTO notifications (recipient_id, type, read, data, created_at) "
-        "VALUES (%s, %s, false, %s, %s) RETURNING id",
-        (recipient_id, type_ if type_ in VALID_TYPES else "system", Json(data or {}), now()),
+    try:
+        recipient = ObjectId(recipient_id)
+    except Exception:
+        return
+    db[COLLECTIONS["notifications"]].insert_one(
+        {
+            "recipient": recipient,
+            "type": type_ if type_ in VALID_TYPES else "system",
+            "read": False,
+            "data": data or {},
+            "created_at": now(),
+        }
     )
 
 
@@ -54,44 +60,39 @@ def _public(doc: dict) -> dict:
 
 
 def list_notifications(db, user: dict, unread_only: bool = False, page: int = 1, page_size: int = 20) -> dict:
-    where = ["recipient_id = %s"]
-    params: list = [user["_id"]]
+    query: dict = {"recipient": user["_id"]}
     if unread_only:
-        where.append("read = false")
-    clause = " AND ".join(where)
-    total = fetch_one(db, f"SELECT count(*) AS n FROM notifications WHERE {clause}", tuple(params))["n"]
-    rows = fetch_all(
-        db,
-        f"SELECT {NOTIF_COLS} FROM notifications WHERE {clause} ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        tuple(params) + (page_size, (page - 1) * page_size),
-    )
-    items = [_public(d) for d in rows]
+        query["read"] = False
+    coll = db[COLLECTIONS["notifications"]]
+    total = coll.count_documents(query)
+    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
+    items = [_public(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
 
 
 def unread_count(db, user: dict) -> int:
-    return fetch_one(
-        db, "SELECT count(*) AS n FROM notifications WHERE recipient_id = %s AND read = false", (user["_id"],)
-    )["n"]
+    return db[COLLECTIONS["notifications"]].count_documents({"recipient": user["_id"], "read": False})
 
 
 def mark_read(db, user: dict, notification_id: str) -> dict:
-    row = fetch_one(
-        db,
-        "UPDATE notifications SET read = true WHERE id = %s AND recipient_id = %s RETURNING id AS _id",
-        (notification_id, user["_id"]),
+    try:
+        oid = ObjectId(notification_id)
+    except Exception as exc:
+        raise NotFound("notification not found") from exc
+    result = db[COLLECTIONS["notifications"]].update_one(
+        {"_id": oid, "recipient": user["_id"]}, {"$set": {"read": True}}
     )
-    if row is None:
+    if result.matched_count == 0:
         raise NotFound("notification not found")
     return {"id": notification_id, "read": True}
 
 
 def mark_all_read(db, user: dict) -> dict:
-    updated = execute(
-        db, "UPDATE notifications SET read = true WHERE recipient_id = %s AND read = false", (user["_id"],)
+    result = db[COLLECTIONS["notifications"]].update_many(
+        {"recipient": user["_id"], "read": False}, {"$set": {"read": True}}
     )
-    return {"updated": updated}
+    return {"updated": result.modified_count}
 
 
 def clear_read(db, user: dict) -> None:
-    execute(db, "DELETE FROM notifications WHERE recipient_id = %s AND read = true", (user["_id"],))
+    db[COLLECTIONS["notifications"]].delete_many({"recipient": user["_id"], "read": True})

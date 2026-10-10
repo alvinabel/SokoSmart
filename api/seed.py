@@ -11,16 +11,13 @@ import random
 import sys
 from datetime import datetime, timezone
 
-from psycopg.types.json import Json
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BASE_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from shared.db import fetch_one, get_conn, insert_returning  # noqa: E402
+from shared.mongo import COLLECTIONS, ensure_indexes, get_db  # noqa: E402
 from shared.roles import Role  # noqa: E402
-from shared.schema import ensure_schema  # noqa: E402
 
 SEED_DEMO_ITEMS = os.getenv("SEED_DEMO_ITEMS", "true").lower() in ("1", "true", "yes")
 
@@ -41,11 +38,11 @@ def now() -> datetime:
 
 
 def run(db, seller_email: str = "seller@agrobasket.test") -> dict:
-    ensure_schema(db)
+    ensure_indexes(db)
 
-    seller = fetch_one(db, "SELECT id AS _id, email FROM users WHERE email = %s", (seller_email,))
+    seller = db[COLLECTIONS["users"]].find_one({"email": seller_email})
     if seller is None:
-        seller = fetch_one(db, "SELECT id AS _id, email FROM users WHERE role = %s LIMIT 1", (Role.SELLER,))
+        seller = db[COLLECTIONS["users"]].find_one({"role": Role.SELLER})
     if seller is None:
         return {"listings_created": 0, "reason": "no seller account found; run backend seed first"}
 
@@ -54,37 +51,29 @@ def run(db, seller_email: str = "seller@agrobasket.test") -> dict:
 
     created = 0
     for item in DEMO_LISTINGS:
-        if fetch_one(
-            db,
-            "SELECT 1 AS ok FROM listings WHERE title = %s AND seller_id = %s",
-            (item["title"], seller["_id"]),
-        ):
+        exists = db[COLLECTIONS["listings"]].find_one(
+            {"title": item["title"], "seller": seller["_id"]}
+        )
+        if exists:
             continue
-        insert_returning(
-            db,
-            """
-            INSERT INTO listings
-                (title, description, category, price, unit, quantity, quality,
-                 location, images, seller_id, status, views, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                item["title"],
-                f"{item['title']} available for wholesale and retail. "
+        db[COLLECTIONS["listings"]].insert_one(
+            {
+                "title": item["title"],
+                "description": f"{item['title']} available for wholesale and retail. "
                 f"Quality: {item['quality']}. Contact seller for bulk pricing.",
-                item["category"],
-                item["price"],
-                item["unit"],
-                item["quantity"],
-                item["quality"],
-                Json({"city": item["city"]}),
-                Json([]),
-                seller["_id"],
-                random.randint(5, 300),
-                now(),
-                now(),
-            ),
+                "category": item["category"],
+                "price": item["price"],
+                "unit": item["unit"],
+                "quantity": item["quantity"],
+                "quality": item["quality"],
+                "location": {"city": item["city"]},
+                "images": [],
+                "seller": seller["_id"],
+                "status": "active",
+                "views": random.randint(5, 300),
+                "created_at": now(),
+                "updated_at": now(),
+            }
         )
         created += 1
 
@@ -92,5 +81,4 @@ def run(db, seller_email: str = "seller@agrobasket.test") -> dict:
 
 
 if __name__ == "__main__":
-    with get_conn() as db:
-        print("seed complete:", run(db))
+    print("seed complete:", run(get_db()))

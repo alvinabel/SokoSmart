@@ -7,15 +7,13 @@ services can read ``g.user["_id"]`` / ``g.user["role"]``.
 from functools import wraps
 
 import jwt as pyjwt
+from bson import ObjectId
 from flask import g, request
 
 from shared.errors import Forbidden, Unauthorized
 from shared.jwt_token import decode_token
+from shared.mongo import get_db
 from shared.roles import user_has as _user_has
-
-from .db import get_db
-
-USER_COLS = "id AS _id, name, email, role, phone, bio, location, status, verified, rating, created_at"
 
 
 def jwt_required(fn):
@@ -33,9 +31,7 @@ def jwt_required(fn):
         except pyjwt.PyJWTError as exc:
             raise Unauthorized("invalid or expired token") from exc
 
-        from shared.db import fetch_one
-
-        user = fetch_one(get_db(), f"SELECT {USER_COLS} FROM users WHERE id = %s", (claims.get("sub"),))
+        user = get_db().users.find_one({"_id": ObjectId(claims["sub"])})
         if user is None:
             raise Unauthorized("user no longer exists")
 

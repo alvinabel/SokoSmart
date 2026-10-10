@@ -9,9 +9,9 @@ from fastapi.responses import JSONResponse
 
 from shared import ApiError, get_config
 from shared.categories import CATEGORIES
-from shared.db import get_conn
-from shared.schema import ensure_schema
+from shared.mongo import COLLECTIONS, ensure_indexes
 
+from .core.mongo import get_db
 from .routers import (
     bids,
     categories,
@@ -31,19 +31,19 @@ ROUTERS = (listings, categories, favorites, bids, orders, reviews, notifications
 
 def _seed_categories(db) -> None:
     """Ensure the storefront always has categories, even before seeders run."""
+    coll = db[COLLECTIONS["categories"]]
     for cat in CATEGORIES:
-        db.execute(
-            "INSERT INTO categories (slug, name, emoji, color) VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (slug) DO NOTHING",
-            (cat["slug"], cat.get("name", cat["slug"]), cat.get("emoji", "🥬"), cat.get("color", "#4CAF50")),
-        )
+        coll.update_one({"slug": cat["slug"]}, {"$setOnInsert": cat}, upsert=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    with get_conn() as db:
-        ensure_schema(db)
-        _seed_categories(db)
+    db = get_db()
+    try:
+        ensure_indexes(db)
+    except Exception:  # pragma: no cover - best effort; mongomock/atlas quirk tolerance
+        logger.warning("could not ensure Mongo indexes on boot")
+    _seed_categories(db)
     yield
 
 
@@ -86,8 +86,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health", tags=["meta"])
     def health():
-        with get_conn() as db:
-            db.execute("SELECT 1")
+        get_db().command("ping")
         return {"status": "ok", "service": "agrobasket-api", "env": cfg.app_env}
 
     @app.exception_handler(ApiError)

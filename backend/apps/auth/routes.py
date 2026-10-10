@@ -5,8 +5,8 @@ from flask import Blueprint, g, jsonify, request
 from pydantic import ValidationError as PydanticValidationError
 
 from shared.errors import ValidationError
+from shared.mongo import get_db
 
-from ..common.db import get_db
 from ..common.decorators import jwt_required
 from . import service
 from .schemas import ForgotIn, LoginIn, RefreshIn, RegisterIn

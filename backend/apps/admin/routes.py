@@ -3,9 +3,9 @@
 from flask import Blueprint, g, jsonify, request
 
 from shared.errors import Forbidden
+from shared.mongo import get_db
 from shared.roles import user_has
 
-from ..common.db import get_db
 from ..common.decorators import jwt_required, require_permission
 from . import service
 

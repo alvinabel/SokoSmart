@@ -7,7 +7,7 @@ Single source of truth for cross-service concerns:
 - role-based access control (``roles``)
 - error types that map to HTTP responses (``errors``)
 - canonical marketplace seed data (``categories``)
-- a PostgreSQL connection pool (``db``) and schema (``schema``)
+- a small PyMongo bootstrap (``mongo``)
 
 Every service ``sys.path``-imports this package (see ``infra/seed_all.py`` for
 the canonical wiring) so behaviour stays consistent across Flask and FastAPI.

@@ -4,24 +4,25 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from shared.db import execute, fetch_one
+from bson import ObjectId
+from pymongo import DESCENDING
+
 from shared.errors import NotFound
+from shared.mongo import COLLECTIONS
 from shared.roles import Role
 
-from .serializers import get_user, iso, user_summary
+from .serializers import iso, user_summary
 
 
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _shape(db, user: dict) -> dict:
+def me(db, user: dict) -> dict:
     rating = user.get("rating") or {"avg": 0, "count": 0}
-    listing_count = fetch_one(
-        db,
-        "SELECT count(*) AS n FROM listings WHERE seller_id = %s AND status <> 'deleted'",
-        (user["_id"],),
-    )["n"]
+    listing_count = db[COLLECTIONS["listings"]].count_documents(
+        {"seller": user["_id"], "status": {"$ne": "deleted"}}
+    )
     return {
         "id": str(user["_id"]),
         "name": user.get("name", ""),
@@ -37,46 +38,40 @@ def _shape(db, user: dict) -> dict:
     }
 
 
-def me(db, user: dict) -> dict:
-    return _shape(db, user)
-
-
 def update(db, user: dict, data: dict) -> dict:
-    sets: list[str] = []
-    params: list = []
+    payload: dict = {}
     if data.get("name"):
-        sets.append("name = %s")
-        params.append(data["name"].strip())
+        payload["name"] = data["name"].strip()
     if data.get("phone") is not None:
-        sets.append("phone = %s")
-        params.append(data["phone"])
+        payload["phone"] = data["phone"]
     if data.get("bio") is not None:
-        sets.append("bio = %s")
-        params.append(data["bio"])
+        payload["bio"] = data["bio"]
     if data.get("location_city"):
-        sets.append("location = jsonb_set(location, '{city}', to_jsonb(%s))")
-        params.append(data["location_city"])
+        payload["location.city"] = data["location_city"]
 
-    if sets:
-        sets.append("updated_at = %s")
-        params.extend([now(), user["_id"]])
-        execute(db, f"UPDATE users SET {', '.join(sets)} WHERE id = %s", tuple(params))
+    if payload:
+        payload["updated_at"] = now()
+        db[COLLECTIONS["users"]].update_one({"_id": user["_id"]}, {"$set": payload})
 
-    return me(db, get_user(db, user["_id"]))
+    fresh = db[COLLECTIONS["users"]].find_one({"_id": user["_id"]})
+    return me(db, fresh)
 
 
 def become_seller(db, user: dict) -> dict:
     if user.get("role") == Role.BUYER:
-        execute(
-            db,
-            "UPDATE users SET role = %s, updated_at = %s WHERE id = %s",
-            (Role.SELLER, now(), user["_id"]),
+        db[COLLECTIONS["users"]].update_one(
+            {"_id": user["_id"]}, {"$set": {"role": Role.SELLER, "updated_at": now()}}
         )
-    return me(db, get_user(db, user["_id"]))
+    fresh = db[COLLECTIONS["users"]].find_one({"_id": user["_id"]})
+    return me(db, fresh)
 
 
 def public_profile(db, user_id: str, limit: int = 12) -> dict:
-    user = get_user(db, user_id)
+    try:
+        oid = ObjectId(user_id)
+    except Exception as exc:
+        raise NotFound("user not found") from exc
+    user = db[COLLECTIONS["users"]].find_one({"_id": oid})
     if user is None:
         raise NotFound("user not found")
 

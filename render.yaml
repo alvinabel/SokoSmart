@@ -4,7 +4,7 @@
 # Usage:
 #   1. render.com -> New -> Blueprint -> connect this GitHub repo.
 #   2. When prompted, fill the `sync: false` variables (secrets):
-#        DATABASE_URL     - Supabase Postgres connection string
+#        MONGO_URI        - Atlas connection string
 #        JWT_SECRET       - MUST be identical on both services (set the same value)
 #        CORS_ORIGINS     - https://<your-app>.vercel.app
 #   3. First deploy of `backend` seeds admin/demo data (idempotent, on every boot).
@@ -28,10 +28,10 @@ services:
     envVars:
       - key: APP_ENV
         value: production
-      - key: DATABASE_URL
+      - key: MONGO_URI
         sync: false
-      - key: DB_POOL_MAX
-        value: "10"
+      - key: MONGO_DB
+        value: agrobasket
       - key: JWT_SECRET
         sync: false
       - key: ACCESS_TOKEN_TTL_MINUTES
@@ -65,10 +65,10 @@ services:
     envVars:
       - key: APP_ENV
         value: production
-      - key: DATABASE_URL
+      - key: MONGO_URI
         sync: false
-      - key: DB_POOL_MAX
-        value: "10"
+      - key: MONGO_DB
+        value: agrobasket
       - key: JWT_SECRET
         sync: false
       - key: ACCESS_TOKEN_TTL_MINUTES

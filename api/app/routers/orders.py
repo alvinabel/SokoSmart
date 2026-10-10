@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, Query, status
 
-from ..core.db import get_db
+from ..core.mongo import get_db
 from ..dependencies import require_permission
 from ..schemas import OrderAction, OrderCreate
 from ..services import orders as svc

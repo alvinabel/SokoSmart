@@ -3,7 +3,7 @@ FastAPI marketplace API.
 
 Single signing key (``JWT_SECRET``) means a token minted by ``backend`` can be
 trusted by ``api`` without a second round trip. Access tokens are short lived;
-refresh tokens carry a ``jti`` and are revocable (stored in ``refresh_tokens``).
+refresh tokens carry a ``jti`` and are revocable (stored in Mongo).
 """
 
 from __future__ import annotations

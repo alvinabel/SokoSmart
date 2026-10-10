@@ -10,15 +10,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from shared.db import execute, fetch_all, fetch_one, insert_returning
+from bson import ObjectId
+from pymongo import DESCENDING
+
 from shared.errors import Forbidden, NotFound, ValidationError
+from shared.mongo import COLLECTIONS
 from shared.roles import Role
 
 from .notifications import notify
 from .orders import insert_order
-from .serializers import get_listing_row
-
-BID_COLS = "id AS _id, listing_id AS listing, bidder_id AS bidder, amount, status, created_at, updated_at, accepted_at"
 
 
 def now() -> datetime:
@@ -26,7 +26,7 @@ def now() -> datetime:
 
 
 def _bid_public(db, bid: dict) -> dict:
-    listing = get_listing_row(db, bid.get("listing"))
+    listing = db[COLLECTIONS["listings"]].find_one({"_id": bid.get("listing")})
     return {
         "id": str(bid["_id"]),
         "listing_id": str(bid.get("listing")),
@@ -38,7 +38,10 @@ def _bid_public(db, bid: dict) -> dict:
 
 
 def create(db, user: dict, listing_id: str, amount: float) -> dict:
-    listing = get_listing_row(db, listing_id)
+    try:
+        listing = db[COLLECTIONS["listings"]].find_one({"_id": ObjectId(listing_id)})
+    except Exception as exc:
+        raise NotFound("listing not found") from exc
     if listing is None or listing.get("status") == "deleted":
         raise NotFound("listing not found")
     if listing.get("status") != "active":
@@ -46,50 +49,44 @@ def create(db, user: dict, listing_id: str, amount: float) -> dict:
     if listing.get("seller") == user["_id"]:
         raise ValidationError("cannot bid on your own listing")
 
-    row = insert_returning(
-        db,
-        f"""
-        INSERT INTO bids (listing_id, bidder_id, amount, status, created_at)
-        VALUES (%s, %s, %s, 'pending', %s)
-        RETURNING {BID_COLS}
-        """,
-        (listing["_id"], user["_id"], round(float(amount), 2), now()),
-    )
-    notify(db, str(listing.get("seller")), "bid.new", {"listing_id": listing_id, "amount": row["amount"]})
-    return _bid_public(db, row)
+    doc = {
+        "listing": listing["_id"],
+        "bidder": user["_id"],
+        "amount": round(float(amount), 2),
+        "status": "pending",
+        "created_at": now(),
+    }
+    result = db[COLLECTIONS["bids"]].insert_one(doc)
+    doc["_id"] = result.inserted_id
+    notify(db, str(listing.get("seller")), "bid.new", {"listing_id": listing_id, "amount": doc["amount"]})
+    return _bid_public(db, doc)
 
 
 def list_mine(db, user: dict, page: int = 1, page_size: int = 20) -> dict:
-    total = fetch_one(db, "SELECT count(*) AS n FROM bids WHERE bidder_id = %s", (user["_id"],))["n"]
-    rows = fetch_all(
-        db,
-        f"SELECT {BID_COLS} FROM bids WHERE bidder_id = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-        (user["_id"], page_size, (page - 1) * page_size),
-    )
-    items = [_bid_public(db, b) for b in rows]
+    coll = db[COLLECTIONS["bids"]]
+    query = {"bidder": user["_id"]}
+    total = coll.count_documents(query)
+    cursor = coll.find(query).sort("created_at", DESCENDING).skip((page - 1) * page_size).limit(page_size)
+    items = [_bid_public(db, b) for b in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": max((total + page_size - 1) // page_size, 1)}
 
 
 def list_for_listing(db, user: dict, listing_id: str) -> list[dict]:
-    listing = get_listing_row(db, listing_id)
+    listing = db[COLLECTIONS["listings"]].find_one({"_id": _oid(listing_id)})
     if listing is None:
         raise NotFound("listing not found")
     role = user.get("role")
     if listing.get("seller") != user["_id"] and role not in (Role.ADMIN, Role.MODERATOR):
         raise Forbidden("only the listing owner may view bids")
-    rows = fetch_all(
-        db,
-        f"SELECT {BID_COLS} FROM bids WHERE listing_id = %s ORDER BY amount DESC",
-        (listing["_id"],),
-    )
-    return [_bid_public(db, b) for b in rows]
+    bids = db[COLLECTIONS["bids"]].find({"listing": listing["_id"]}).sort("amount", DESCENDING)
+    return [_bid_public(db, b) for b in bids]
 
 
 def respond(db, user: dict, bid_id: str, action: str) -> dict:
-    bid = fetch_one(db, f"SELECT {BID_COLS} FROM bids WHERE id = %s", (bid_id,))
+    bid = db[COLLECTIONS["bids"]].find_one({"_id": _oid(bid_id)})
     if bid is None:
         raise NotFound("bid not found")
-    listing = get_listing_row(db, bid.get("listing"))
+    listing = db[COLLECTIONS["listings"]].find_one({"_id": bid.get("listing")})
     if listing is None:
         raise NotFound("listing not found")
     role = user.get("role")
@@ -99,28 +96,19 @@ def respond(db, user: dict, bid_id: str, action: str) -> dict:
         raise ValidationError("bid is no longer pending")
 
     if action == "decline":
-        row = fetch_one(
-            db,
-            f"UPDATE bids SET status = 'declined', updated_at = %s WHERE id = %s RETURNING {BID_COLS}",
-            (now(), bid["_id"]),
-        )
-        return _bid_public(db, row)
+        db[COLLECTIONS["bids"]].update_one({"_id": bid["_id"]}, {"$set": {"status": "declined", "updated_at": now()}})
+        return _bid_public(db, db[COLLECTIONS["bids"]].find_one({"_id": bid["_id"]}))
 
     # accept:
-    execute(
-        db,
-        "UPDATE bids SET status = 'declined', updated_at = %s WHERE listing_id = %s AND status = 'pending'",
-        (now(), bid["listing"]),
+    db[COLLECTIONS["bids"]].update_many(
+        {"listing": bid["listing"], "status": "pending"},
+        {"$set": {"status": "declined", "updated_at": now()}},
     )
-    fetch_one(
-        db,
-        f"UPDATE bids SET status = 'accepted', accepted_at = %s WHERE id = %s RETURNING {BID_COLS}",
-        (now(), bid["_id"]),
+    db[COLLECTIONS["bids"]].update_one(
+        {"_id": bid["_id"]}, {"$set": {"status": "accepted", "accepted_at": now()}}
     )
-    fetch_one(
-        db,
-        "UPDATE listings SET status = 'sold', sold_price = %s, updated_at = %s WHERE id = %s RETURNING id",
-        (bid["amount"], now(), listing["_id"]),
+    db[COLLECTIONS["listings"]].update_one(
+        {"_id": listing["_id"]}, {"$set": {"status": "sold", "sold_price": bid["amount"], "updated_at": now()}}
     )
     insert_order(
         db,
@@ -132,5 +120,11 @@ def respond(db, user: dict, bid_id: str, action: str) -> dict:
         note=f"Accepted bid of {bid['amount']}",
     )
     notify(db, str(bid.get("bidder")), "bid.accepted", {"listing_id": str(listing["_id"]), "amount": bid["amount"]})
-    row = fetch_one(db, f"SELECT {BID_COLS} FROM bids WHERE id = %s", (bid["_id"],))
-    return _bid_public(db, row)
+    return _bid_public(db, db[COLLECTIONS["bids"]].find_one({"_id": bid["_id"]}))
+
+
+def _oid(bid_id: str) -> ObjectId:
+    try:
+        return ObjectId(bid_id)
+    except Exception as exc:
+        raise NotFound("bid not found") from exc
